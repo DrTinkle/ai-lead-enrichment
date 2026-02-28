@@ -15,7 +15,7 @@ st.sidebar.header("Acquisition Thesis")
 
 selected_sector = st.sidebar.selectbox(
     "Target Sector",
-    ["Fintech", "SaaS", "Internet / Technology", "Healthcare", "Retail / E-commerce"],
+    ["Fintech", "SaaS", "Internet / Technology", "Healthcare", "Retail", "E-commerce"],
     index=0
 )
 
