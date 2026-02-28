@@ -1,0 +1,64 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+.env.local
+
+# Environment variables
+.env
+
+# SQLite database (if added later)
+*.db
+*.sqlite3
+
+# Cache data (file-based enrichment cache)
+data/cache/
+data/enrichment.db
+
+# Logs
+logs/
+*.log
+
+# Data outputs
+data/output/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Type checking
+.mypy_cache/
+
+# FastAPI / Uvicorn (future-proofing)
+*.pid
+
+# Streamlit
+.streamlit/
+
+# Misc
+folder_structure.txt
