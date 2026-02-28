@@ -1,5 +1,10 @@
 # AI-Powered Lead / Company Enrichment Tool
 
+### Live Demo
+
+A live version of the application is available at:  
+https://web-production-0ea73.up.railway.app
+
 ## Overview
 
 This project is a Python-based lead enrichment and acquisition screening tool.
@@ -162,4 +167,5 @@ This project demonstrates:
 - Practical LLM usage  
 - Rule-based scoring logic  
 - Business-aware automation  
+
 - Clean modular architecture  
