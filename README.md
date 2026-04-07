@@ -3,7 +3,7 @@
 ### Live Demo
 
 A live version of the application is available at:  
-https://web-production-0ea73.up.railway.app
+[https://ai-lead-enrichment.streamlit.app/](https://ai-lead-enrichment.streamlit.app/)
 
 ## Overview
 
