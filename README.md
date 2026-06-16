@@ -2,6 +2,8 @@
 
 A Streamlit-based company screening tool for evaluating acquisition targets. Enter a company domain, configure a thesis, and get a scored analysis drawn from live data across six signal sources.
 
+**Live demo:** [https://ai-lead-enrichment.streamlit.app/](https://ai-lead-enrichment.streamlit.app/)
+
 ---
 
 ## What It Does
