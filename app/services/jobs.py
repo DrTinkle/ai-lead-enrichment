@@ -28,26 +28,53 @@ TIMEOUT = 12
 UA      = "Mozilla/5.0 (compatible; lead-enrichment-bot/0.1)"
 HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
 
-# ── URL candidates ─────────────────────────────────────────────────────────────
+# ----------------------------------------
 
 CANDIDATE_PATHS = [
-    "/jobs/search",
-    "/careers/search",
-    "/careers/open-roles",
-    "/jobs/open-roles",
-    "/jobs/positions",
-    "/careers/positions",
-    "/jobs",
-    "/careers",
-    "/join-us",
-    "/company/careers",
-    "/about/careers",
-    "/work-with-us",
-    "/openings",
-    "/positions",
+    # Deeper paths first (more specific = tried first), then single-segment fallbacks
+    "/about-us/careers", "/about-us/jobs",
+    "/about/careers", "/about/jobs", "/about/work-with-us",
+    "/careers/all", "/careers/jobs", "/careers/list", "/careers/listings",
+    "/careers/open-positions", "/careers/open-roles", "/careers/openings",
+    "/careers/positions", "/careers/search",
+    "/company/careers", "/company/jobs", "/company/openings",
+    "/company/positions", "/company/work-with-us",
+    "/culture/careers", "/culture/jobs",
+    "/en-gb/careers", "/en-gb/jobs", "/en-us/careers", "/en-us/jobs",
+    "/en/careers", "/en/jobs",
+    "/engineering/careers", "/engineering/jobs",
+    "/get-involved/careers",
+    "/global/careers", "/global/jobs",
+    "/grow/careers", "/grow/jobs",
+    "/hr/careers", "/hr/jobs",
+    "/jobs/all", "/jobs/list", "/jobs/listings", "/jobs/open-positions",
+    "/jobs/open-roles", "/jobs/openings", "/jobs/positions", "/jobs/search",
+    "/life/careers", "/life/jobs",
+    "/our-team/careers", "/our-team/jobs",
+    "/people/careers", "/people/jobs",
+    "/talent/careers", "/talent/jobs",
+    "/team/careers", "/team/jobs",
+    "/tech/careers", "/tech/jobs",
+    "/technology/careers", "/technology/jobs",
+    "/us/careers", "/us/jobs",
+    "/work/careers", "/work/jobs", "/work/openings", "/work/positions",
+    # Single-segment
+    "/apply", "/available-jobs", "/available-positions", "/available-roles",
+    "/be-part-of-us", "/become-a-part", "/browse-jobs",
+    "/career-center", "/career-opportunities", "/career-portal", "/career-site",
+    "/careers", "/current-jobs", "/current-openings", "/current-positions",
+    "/employment", "/explore-careers", "/explore-jobs",
+    "/find-a-job", "/find-jobs", "/get-involved", "/hiring",
+    "/job-board", "/job-list", "/job-listings", "/job-opportunities", "/jobs",
+    "/join", "/join-us",
+    "/open-jobs", "/open-positions", "/open-roles", "/openings", "/opportunities",
+    "/positions", "/recruiting", "/recruitment",
+    "/search-jobs", "/see-jobs", "/talent", "/vacancies", "/view-jobs",
+    "/we-are-hiring", "/work-at", "/work-here", "/work-with-us",
+    "/working-at", "/working-here",
 ]
 
-# ── Page-type classifier ───────────────────────────────────────────────────────
+# ----------------------------------------
 
 LISTING_KEYWORDS = [
     "open roles", "search jobs", "apply", "department", "location",
@@ -80,7 +107,7 @@ def _classify_page(html: str) -> str:
     return "unknown"
 
 
-# ── ATS detection ──────────────────────────────────────────────────────────────
+# ----------------------------------------
 
 ATS_PATTERNS = {
     "greenhouse":     ["boards.greenhouse.io", "greenhouse.io/embed"],
@@ -116,7 +143,7 @@ def _extract_ats_slug(html: str, links: list[str], ats: str) -> Optional[str]:
     return None
 
 
-# ── ATS APIs ───────────────────────────────────────────────────────────────────
+# ----------------------------------------
 
 def _fetch_greenhouse(slug: str) -> Optional[list[dict]]:
     url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
@@ -163,7 +190,7 @@ def _fetch_lever(slug: str) -> Optional[list[dict]]:
         return None
 
 
-# ── Embedded JSON extraction ───────────────────────────────────────────────────
+# ----------------------------------------
 
 def _extract_embedded_jobs(html: str) -> list[dict]:
     """Try to pull job listings from __NEXT_DATA__ or other script-embedded JSON."""
@@ -213,7 +240,7 @@ def _extract_embedded_jobs(html: str) -> list[dict]:
     return [j for j in jobs if j.get("title")]
 
 
-# ── Generic page scraper ───────────────────────────────────────────────────────
+# ----------------------------------------
 
 TITLE_KW = re.compile(
     r"\b(engineer|developer|manager|analyst|designer|director|lead|"
@@ -305,7 +332,7 @@ def _count_from_page(html: str) -> int:
     return min(sum(1 for el in candidates if kw.search(el.get_text(" ", strip=True)[:80])), 200)
 
 
-# ── Main careers page pipeline ─────────────────────────────────────────────────
+# ----------------------------------------
 
 def _fetch_page(url: str) -> Optional[requests.Response]:
     try:
@@ -458,7 +485,7 @@ def _scrape_company_careers(domain: str) -> Optional[dict]:
     }
 
 
-# ── Adzuna (last resort) ───────────────────────────────────────────────────────
+# ----------------------------------------
 
 _ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
 
@@ -556,7 +583,7 @@ def _fetch_adzuna_last_resort(company_name: str, domain: str) -> Optional[dict]:
     }
 
 
-# ── Job categorizer ────────────────────────────────────────────────────────────
+# ----------------------------------------
 
 JOB_CATEGORIES = {
     "engineering": ["engineer", "developer", "software", "backend", "frontend", "sre", "devops", "architect", "infra"],
@@ -587,8 +614,6 @@ def _classify_functions(titles: list[str]) -> list[str]:
     return [c for c, _ in sorted(cats.items(), key=lambda x: -x[1])][:5]
 
 
-# ── Department-weighted growth signal ──────────────────────────────────────────
-
 def _growth_bonus(categories: dict[str, int]) -> float:
     weighted = (
         categories.get("engineering", 0) * 1.0 +
@@ -608,20 +633,20 @@ def _growth_bonus(categories: dict[str, int]) -> float:
     return 1.5
 
 
-# ── Public entry point ─────────────────────────────────────────────────────────
-
 def fetch_job_postings(company_name: str, domain: str,
-                       industry: Optional[str] = None,
-                       sector: Optional[str] = None) -> Optional[dict]:
+                       industry: str = None,
+                       sector: str = None) -> dict:
     result = _scrape_company_careers(domain)
 
     if result:
-        logger.warning(
+        import logging
+        logging.getLogger(__name__).warning(
             f"Jobs: {result['source_type']} found {result['posting_count']} postings "
             f"for {domain} (confidence={result['confidence']:.0%})"
         )
     else:
-        logger.warning(f"Jobs: no careers page found for {domain} — trying Adzuna")
+        import logging
+        logging.getLogger(__name__).warning(f"Jobs: no careers page found for {domain} -- trying Adzuna")
         result = _fetch_adzuna_last_resort(company_name, domain)
 
     if not result:
