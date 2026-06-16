@@ -434,14 +434,42 @@ if submitted:
         with col_e2:
             st.markdown('<div class="section-title">Job Postings</div>', unsafe_allow_html=True)
             if jobs:
-                ats_html = f'<div style="font-size:13px;color:#4a90d9;margin-bottom:10px;">ATS: <b>{jobs["ats_detected"]}</b></div>' if jobs.get("ats_detected") else ""
-                fn_rows = "".join(f'<div class="profile-row"><span class="profile-key">{fn}</span><span class="profile-val" style="color:#4a90d9;">Hiring</span></div>' for fn in (jobs.get("top_functions") or []))
-                locs = ", ".join(jobs.get("top_locations",[])[:3]) or "Not specified"
-                sample_listings = jobs.get("sample_listings") or []
+                source_type = jobs.get("source_type", "")
+                source_label_map = {
+                    "greenhouse_api":       "Greenhouse API",
+                    "lever_api":            "Lever API",
+                    "embedded_json":        "Embedded JSON",
+                    "scraped_careers_page": "Careers Page",
+                    "careers+adzuna":       "Careers Page",
+                    "adzuna_filtered":      "Adzuna (filtered)",
+                }
+                source_label = source_label_map.get(source_type, source_type)
+                conf_pct     = int(jobs.get("confidence", 1.0) * 100)
+                source_html  = f'<div style="font-size:12px;color:#4a5568;margin-bottom:10px;">{source_label} · {conf_pct}% confidence</div>'
+                ats_html     = f'<div style="font-size:13px;color:#4a90d9;margin-bottom:8px;">ATS: <b>{jobs["ats_detected"].title()}</b></div>' if jobs.get("ats_detected") else ""
+                # Department breakdown
+                categories   = jobs.get("categories") or {}
+                cat_order    = ["engineering","data_ai","sales","product","customer","security","marketing","finance","operations"]
+                cat_labels   = {"engineering":"Engineering","data_ai":"Data / AI","sales":"Sales","product":"Product",
+                                "customer":"Customer","security":"Security","marketing":"Marketing","finance":"Finance","operations":"Operations"}
+                fn_rows      = "".join(
+                    f'<div class="profile-row"><span class="profile-key">{cat_labels.get(c,c)}</span>'
+                    f'<span class="profile-val" style="color:#4a90d9;">{categories[c]} roles</span></div>'
+                    for c in cat_order if categories.get(c, 0) > 0
+                ) or "".join(
+                    f'<div class="profile-row"><span class="profile-key">{fn}</span>'
+                    f'<span class="profile-val" style="color:#4a90d9;">Hiring</span></div>'
+                    for fn in (jobs.get("top_functions") or [])
+                )
+                locs_list    = jobs.get("top_locations", [])[:3]
+                locs_html    = f'<div style="font-size:13px;color:#8b9eb0;margin-bottom:10px;">{", ".join(locs_list)}</div>' if locs_list else ""
+                careers_url  = jobs.get("careers_url") or jobs.get("source", "")
+                careers_link = f'<div style="margin-top:12px;"><a href="{careers_url}" target="_blank" style="font-size:13px;color:#4a90d9;text-decoration:none;">View all openings →</a></div>' if careers_url and careers_url.startswith("http") else ""
+                sample_listings = [l for l in (jobs.get("sample_listings") or []) if l.get("title")]
                 if sample_listings:
                     listings_html = "".join(
                         f'<div style="padding:7px 0;border-bottom:1px solid #1e2530;">' +
-                        (f'<a href="{l["url"]}" target="_blank" style="color:#cdd9e5;font-size:14px;text-decoration:none;">' + l["title"] + '</a>' if l.get("url") else f'<span style="font-size:14px;color:#cdd9e5;">{l["title"]}</span>') +
+                        (f'<a href="{l["url"]}" target="_blank" style="color:#cdd9e5;font-size:14px;text-decoration:none;">{l["title"]}</a>' if l.get("url") else f'<span style="font-size:14px;color:#cdd9e5;">{l["title"]}</span>') +
                         (f'<div style="font-size:12px;color:#4a5568;">{l["location"]}</div>' if l.get("location") else "") +
                         '</div>'
                         for l in sample_listings
@@ -452,9 +480,8 @@ if submitted:
                     samples_section = f'<div style="margin-top:14px;"><div class="evidence-header">Sample Titles</div>{plain}</div>' if plain else ""
                 st.markdown(
                     f'<div class="card"><div style="font-size:36px;font-weight:800;color:#4a90d9;">{jobs["posting_count"]}</div>'
-                    f'<div style="font-size:13px;color:#4a5568;text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px;">Active Postings</div>'
-                    f'{ats_html}<div style="font-size:13px;color:#8b9eb0;margin-bottom:10px;">{locs}</div>'
-                    f'{fn_rows}{samples_section}</div>',
+                    f'<div style="font-size:13px;color:#4a5568;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;">Active Postings</div>'
+                    f'{source_html}{ats_html}{locs_html}{fn_rows}{samples_section}{careers_link}</div>',
                     unsafe_allow_html=True)
             else:
                 st.markdown('<div class="card"><div style="color:#4a5568;">No job postings found.</div></div>', unsafe_allow_html=True)
@@ -526,25 +553,3 @@ if submitted:
                     f'<div class="profile-row"><span class="profile-key">Cash</span><span class="profile-val">{fmt_usd(financials.get("cash"))}</span></div>'
                     f'<div class="profile-row"><span class="profile-key">Debt / Equity</span><span class="profile-val">{de_str}</span></div>'
                     f'</div>', unsafe_allow_html=True)
-            with fc3:
-                upside = financials.get("analyst_upside_pct")
-                u_str = ("%+.1f%%" % upside) if upside is not None else "--"
-                u_col = "#3fb950" if (upside or 0) > 10 else ("#e3b341" if (upside or 0) > 0 else "#f85149")
-                lo = financials.get("price_52w_low"); hi = financials.get("price_52w_high")
-                range_str = ("$%.2f - $%.2f" % (lo, hi)) if lo else "--"
-                pfl = financials.get("pct_from_52w_low")
-                pfl_str = ("+%.1f%% from low" % pfl) if pfl is not None else ""
-                tp = financials.get("target_price")
-                tp_str = ("$%.2f" % tp) if tp else "--"
-                emp = financials.get("employees")
-                emp_str = ("%s" % f"{emp:,}") if emp else "--"
-                st.markdown(
-                    f'<div class="card"><div class="section-title">Market &amp; Analysts</div>'
-                    f'<div class="profile-row"><span class="profile-key">Price</span><span class="profile-val">${financials["price"]:.2f} {financials.get("currency","USD")}</span></div>'
-                    f'<div class="profile-row"><span class="profile-key">52-Week Range</span><span class="profile-val" style="font-size:13px;">{range_str} <span style="color:#4a5568;">{pfl_str}</span></span></div>'
-                    f'<div class="profile-row"><span class="profile-key">Analyst Target</span><span class="profile-val">{tp_str} <span style="color:{u_col};font-weight:700;">{u_str}</span></span></div>'
-                    f'<div class="profile-row"><span class="profile-key">Analyst Rating</span><span class="profile-val" style="color:{ar_col};font-weight:700;">{ar}</span></div>'
-                    f'<div class="profile-row"><span class="profile-key">Employees</span><span class="profile-val">{emp_str}</span></div>'
-                    f'</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="card"><div style="color:#4a5568;">Private company — no public financial data available.</div></div>', unsafe_allow_html=True)

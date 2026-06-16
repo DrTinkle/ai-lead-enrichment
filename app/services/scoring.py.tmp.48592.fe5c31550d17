@@ -314,7 +314,7 @@ def apply_acquisition_scoring(
     # Quality score: 0-10, based on quality signals
     quality_score = round(min((quality_pts / 5.0) * 10, 10.0), 1)
     # Risk score: 0-10 (higher = riskier)
-    risk_score = round(min(risk_pts, 4.0) / 4.0 * 10, 1)
+    risk_score = round(min((risk_pts / 4.0) * 10, 10.0), 1)
 
     return {
         "ai_score":         ai_score,
@@ -330,6 +330,4 @@ def apply_acquisition_scoring(
         "growth_score":     growth_score,
         "quality_score":    quality_score,
         "risk_score":       risk_score,
-        "positive_signals": positives,
-        "risk_flags":       risks,
     }

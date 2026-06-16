@@ -383,10 +383,7 @@ def _scrape_company_careers(domain: str) -> Optional[dict]:
     embedded_jobs = _extract_embedded_jobs(html) if not ats_jobs else []
 
     # Step 6: HTML scraping fallback
-    if ats_jobs or embedded_jobs:
-        scraped_jobs = []
-    else:
-        scraped_jobs = _scrape_listing_page(html, careers_url)
+    scraped_jobs = _scrape_listing_page(html, careers_url) if not ats_jobs and not embedded_jobs else []
 
     # Resolve best job list
     if ats_jobs:
