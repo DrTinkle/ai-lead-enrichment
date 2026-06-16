@@ -63,6 +63,7 @@ LANDING_KEYWORDS = [
 
 JOB_LINK_HINTS = [
     "search", "openings", "open-roles", "positions", "listings",
+    ".jobs/", "jobs.", "/jobs",
     "boards.greenhouse.io", "jobs.lever.co", "workdayjobs.com",
     "ashbyhq.com", "smartrecruiters.com", "jobvite.com",
 ]
@@ -252,7 +253,7 @@ def _scrape_listing_page(html: str, base_url: str) -> list[dict]:
                     url   = urljoin(base_url, link["href"]) if link and link.get("href") else ""
                     loc_el = el.find(class_=re.compile(r"location|city|office", re.I))
                     loc    = loc_el.get_text(strip=True)[:60] if loc_el else ""
-                    if title and TITLE_KW.search(title):
+                    if title and len(title.split()) >= 2 and TITLE_KW.search(title):
                         jobs.append({"title": title, "location": loc, "url": url, "source": "careers_page"})
                 if jobs:
                     return jobs
@@ -260,10 +261,14 @@ def _scrape_listing_page(html: str, base_url: str) -> list[dict]:
             continue
 
     # Fallback: scan headings + li + anchor text
+    # Require at least 2 words to exclude single nav items like "Product" or "Sales"
     seen: set = set()
     for el in soup.find_all(["h2", "h3", "h4", "li", "a"], limit=300):
         text = el.get_text(" ", strip=True)
-        if 4 < len(text) < 100 and TITLE_KW.search(text):
+        words = text.split()
+        if len(words) < 2:
+            continue
+        if 8 < len(text) < 100 and TITLE_KW.search(text):
             norm = text.lower()
             if norm not in seen:
                 seen.add(norm)
@@ -323,17 +328,30 @@ def _scrape_company_careers(domain: str) -> Optional[dict]:
       6. Fall back to HTML scraping
     """
     base = f"https://{domain}"
-    found_pages: list[tuple[str, str, str]] = []  # (url, html, page_type)
+    found_pages: list[tuple[str, str, str]] = []  # (final_url, html, page_type)
 
-    # Step 1 + 2: fetch candidates, classify
-    for path in CANDIDATE_PATHS:
-        url  = urljoin(base, path)
+    # Build URL candidates: subdomains first, then path-based
+    stem = domain.split(".")[0]  # "wolt" from "wolt.com"
+    tld  = ".".join(domain.split(".")[1:])  # "com" from "wolt.com"
+    subdomain_candidates = [
+        f"https://careers.{domain}",
+        f"https://careers.{domain}/en/jobs",
+        f"https://jobs.{domain}",
+        f"https://{stem}.jobs",
+        f"https://{stem}.jobs/en/jobs",
+    ]
+    path_candidates = [urljoin(base, path) for path in CANDIDATE_PATHS]
+    all_candidates  = subdomain_candidates + path_candidates
+
+    # Step 1 + 2: fetch candidates, classify; use resp.url (post-redirect)
+    for url in all_candidates:
         resp = _fetch_page(url)
         if not resp:
             continue
+        final_url = resp.url  # capture actual URL after any redirect
         html      = resp.text
         page_type = _classify_page(html)
-        found_pages.append((url, html, page_type))
+        found_pages.append((final_url, html, page_type))
         if page_type == "job_listing_page":
             break  # found it
 
@@ -347,275 +365,24 @@ def _scrape_company_careers(domain: str) -> Optional[dict]:
     if not listing_pages and landing_pages:
         land_url, land_html, _ = landing_pages[0]
         soup = BeautifulSoup(land_html, "lxml")
+        company_stem = domain.split(".")[0].lower()  # "dropbox" from "dropbox.com"
         for a in soup.find_all("a", href=True):
-            href = a["href"].lower()
-            if any(hint in href for hint in JOB_LINK_HINTS):
-                full = urljoin(land_url, a["href"])
-                if urlparse(full).netloc == domain:
-                    resp = _fetch_page(full)
-                    if resp and _classify_page(resp.text) == "job_listing_page":
-                        listing_pages.append((full, resp.text, "job_listing_page"))
-                        break
-
-    # Use best listing page, fall back to first found
-    if listing_pages:
-        careers_url, html, _ = listing_pages[0]
-    else:
-        careers_url, html, _ = found_pages[0]
-
-    # Step 4: ATS detection
-    soup  = BeautifulSoup(html, "lxml")
-    links = [a.get("href", "") for a in soup.find_all("a", href=True)]
-    ats   = _detect_ats(html, links)
-
-    ats_jobs: list[dict] = []
-    if ats in ("greenhouse", "lever"):
-        slug = _extract_ats_slug(html, links, ats)
-        if slug:
-            if ats == "greenhouse":
-                ats_jobs = _fetch_greenhouse(slug) or []
-            elif ats == "lever":
-                ats_jobs = _fetch_lever(slug) or []
-            if ats_jobs:
-                logger.warning(f"Jobs: {ats} API returned {len(ats_jobs)} postings for slug {slug!r}")
-
-    # Step 5: embedded JSON
-    embedded_jobs = _extract_embedded_jobs(html) if not ats_jobs else []
-
-    # Step 6: HTML scraping fallback
-    if ats_jobs or embedded_jobs:
-        scraped_jobs = []
-    else:
-        scraped_jobs = _scrape_listing_page(html, careers_url)
-
-    # Resolve best job list
-    if ats_jobs:
-        best_jobs   = ats_jobs
-        confidence  = 0.95
-        source_type = f"{ats}_api"
-    elif embedded_jobs:
-        best_jobs   = embedded_jobs
-        confidence  = 0.80
-        source_type = "embedded_json"
-    elif scraped_jobs:
-        best_jobs   = scraped_jobs
-        confidence  = 0.75
-        source_type = "scraped_careers_page"
-    else:
-        best_jobs   = []
-        confidence  = 0.50
-        source_type = "unknown"
-
-    # Posting count: prefer structured count, fall back to heuristic
-    posting_count = len(best_jobs) if best_jobs else _count_from_page(html)
-
-    titles    = [j.get("title", "") for j in best_jobs]
-    locations = [j.get("location", "") for j in best_jobs if j.get("location")]
-
-    return {
-        "source":          careers_url,
-        "source_type":     source_type,
-        "ats_detected":    ats,
-        "posting_count":   posting_count,
-        "confidence":      confidence,
-        "top_functions":   _classify_functions(titles),
-        "top_locations":   [l for l, _ in Counter(locations).most_common(3) if l],
-        "sample_listings": [
-            {"title": j["title"], "location": j.get("location", ""), "url": j.get("url", "")}
-            for j in best_jobs[:8]
-        ],
-        "sample_titles":   titles[:8],
-        "remote_count":    sum(1 for t in titles if "remote" in t.lower()),
-        "careers_url":     careers_url,
-    }
-
-
-# ── Adzuna (last resort) ───────────────────────────────────────────────────────
-
-_ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
-
-
-def _normalize(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower())
-
-
-def _name_similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
-
-
-def _fetch_adzuna_last_resort(company_name: str, domain: str) -> Optional[dict]:
-    if not settings.ADZUNA_APP_ID or not settings.ADZUNA_APP_KEY:
-        return None
-
-    params = {
-        "app_id":           settings.ADZUNA_APP_ID,
-        "app_key":          settings.ADZUNA_APP_KEY,
-        "results_per_page": 50,
-        "what_phrase":      company_name,
-        "title_only":       1,
-    }
-
-    try:
-        resp = requests.get(
-            f"{_ADZUNA_BASE}/us/search/1",
-            params=params,
-            headers={"Accept": "application/json"},
-            timeout=TIMEOUT,
-        )
-    except requests.RequestException as e:
-        logger.warning(f"Adzuna request failed: {e}")
-        return None
-
-    if resp.status_code != 200:
-        logger.warning(f"Adzuna returned {resp.status_code}: {resp.text[:200]}")
-        return None
-
-    raw_jobs = resp.json().get("results", [])
-    if not raw_jobs:
-        return None
-
-    stem     = domain.split(".")[0].lower()
-    cn_lower = company_name.lower()
-    validated = []
-    rejected  = 0
-
-    for j in raw_jobs:
-        posting_company = ((j.get("company") or {}).get("display_name", "") or "").lower()
-        url             = (j.get("redirect_url") or "").lower()
-        title           = j.get("title", "")
-
-        # Strict: employer name must match OR domain stem must appear in URL
-        name_match   = cn_lower in posting_company or posting_company in cn_lower or _name_similarity(company_name, posting_company) >= 0.80
-        domain_match = stem in url or domain.lower() in url
-        labor_flag   = any(f in title.lower() for f in MANUAL_LABOR_FLAGS)
-
-        if labor_flag:
-            rejected += 1
-            logger.warning(f"Adzuna: rejected (labor flag) '{title}' company='{posting_company}'")
-            continue
-
-        if not (name_match or domain_match):
-            rejected += 1
-            logger.warning(f"Adzuna: rejected (entity mismatch) '{title}' company='{posting_company}'")
-            continue
-
-        validated.append({
-            "title":    title,
-            "location": ((j.get("location") or {}).get("display_name", "") or ""),
-            "url":      j.get("redirect_url", ""),
-            "source":   "adzuna",
-        })
-
-    if not validated:
-        logger.warning(f"Adzuna: all {len(raw_jobs)} postings rejected for {company_name!r}")
-        return None
-
-    logger.warning(f"Adzuna (last resort): {len(validated)}/{len(raw_jobs)} passed for {company_name!r}")
-    titles    = [p["title"] for p in validated]
-    locations = [p["location"] for p in validated if p["location"]]
-
-    return {
-        "source":          "adzuna",
-        "source_type":     "adzuna_filtered",
-        "ats_detected":    None,
-        "posting_count":   len(validated),
-        "confidence":      0.40,
-        "top_functions":   _classify_functions(titles),
-        "top_locations":   [l for l, _ in Counter(locations).most_common(3) if l],
-        "sample_listings": [{"title": p["title"], "location": p["location"], "url": p["url"]} for p in validated[:8]],
-        "sample_titles":   titles[:8],
-        "remote_count":    sum(1 for t in titles if "remote" in t.lower()),
-        "careers_url":     "",
-    }
-
-
-# ── Job categorizer ────────────────────────────────────────────────────────────
-
-JOB_CATEGORIES = {
-    "engineering": ["engineer", "developer", "software", "backend", "frontend", "sre", "devops", "architect", "infra"],
-    "data_ai":     ["data", "machine learning", "ml", "ai", "analytics", "scientist"],
-    "sales":       ["sales", "account executive", "business development", "bdr", "sdr"],
-    "customer":    ["support", "customer success", "implementation", "csm"],
-    "product":     ["product manager", "product designer", "product"],
-    "security":    ["security", "risk", "compliance", "fraud"],
-    "finance":     ["finance", "accounting", "controller", "fp&a"],
-    "operations":  ["operations", "people", "legal", "recruiting", "hr"],
-    "marketing":   ["marketing", "growth", "content", "brand", "seo"],
-}
-
-
-def _categorize_jobs(titles: list[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for title in titles:
-        t = title.lower()
-        for cat, kws in JOB_CATEGORIES.items():
-            if any(kw in t for kw in kws):
-                counts[cat] = counts.get(cat, 0) + 1
-                break
-    return counts
-
-
-def _classify_functions(titles: list[str]) -> list[str]:
-    cats = _categorize_jobs(titles)
-    return [c for c, _ in sorted(cats.items(), key=lambda x: -x[1])][:5]
-
-
-# ── Department-weighted growth signal ──────────────────────────────────────────
-
-def _growth_bonus(categories: dict[str, int]) -> float:
-    weighted = (
-        categories.get("engineering", 0) * 1.0 +
-        categories.get("data_ai",     0) * 1.2 +
-        categories.get("sales",       0) * 1.0 +
-        categories.get("product",     0) * 0.8 +
-        categories.get("customer",    0) * 0.6 +
-        categories.get("security",    0) * 0.7 +
-        categories.get("marketing",   0) * 0.7
-    )
-    if weighted == 0:
-        return 0.0
-    if weighted <= 5:
-        return 0.0
-    if weighted <= 15:
-        return 0.5
-    if weighted <= 40:
-        return 1.0
-    return 1.5
-
-
-# ── Public entry point ─────────────────────────────────────────────────────────
-
-def fetch_job_postings(company_name: str, domain: str,
-                       industry: Optional[str] = None,
-                       sector: Optional[str] = None) -> Optional[dict]:
-    """
-    Full hiring signal pipeline. Returns enriched job dict or None.
-
-    Result includes:
-      source, source_type, ats_detected, posting_count, confidence,
-      categories, growth_bonus, top_functions, top_locations,
-      sample_listings, careers_url
-    """
-    # Steps 1-6: careers page pipeline (ATS API → embedded JSON → scrape)
-    result = _scrape_company_careers(domain)
-
-    if result:
-        logger.warning(
-            f"Jobs: {result['source_type']} found {result['posting_count']} postings "
-            f"for {domain} (confidence={result['confidence']:.0%})"
-        )
-    else:
-        # Step 7: Adzuna last resort
-        logger.warning(f"Jobs: no careers page found for {domain} — trying Adzuna")
-        result = _fetch_adzuna_last_resort(company_name, domain)
-
-    if not result:
-        return None
-
-    # Add categories and growth bonus
-    titles      = [j.get("title", "") for j in result.get("sample_listings", [])] or result.get("sample_titles", [])
-    categories  = _categorize_jobs(titles)
-    result["categories"]    = categories
-    result["growth_bonus"]  = _growth_bonus(categories)
-
-    return result
+            raw_href = a["href"]
+            href_lower = raw_href.lower()
+            if not any(hint in href_lower for hint in JOB_LINK_HINTS):
+                continue
+            full = urljoin(land_url, raw_href)
+            parsed = urlparse(full)
+            # Allow same domain OR external job domains (e.g. dropbox.jobs, jobs.dropbox.com)
+            same_domain    = parsed.netloc == domain
+            ext_job_domain = (
+                parsed.netloc.endswith(".jobs") or
+                parsed.netloc.startswith("jobs.") or
+                company_stem in parsed.netloc
+            )
+            if same_domain or ext_job_domain:
+                resp = _fetch_page(full)
+                if resp and _classify_page(resp.text) == "job_listing_page":
+                    listing_pages.append((resp.url, resp.text, "job_listing_page"))
+                    logger.warning(f"Jobs: followed link to listing page {resp.url}")
+                    break
