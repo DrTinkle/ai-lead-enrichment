@@ -1,0 +1,99 @@
+"""
+JSearch (RapidAPI) job postings collector.
+Counts active job postings for a company as a hiring-velocity proxy.
+Skips gracefully if JSEARCH_API_KEY is not set.
+"""
+import logging
+from typing import Optional
+from collections import Counter
+
+import requests
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+_BASE = "https://jsearch.p.rapidapi.com/search"
+TIMEOUT = 10
+
+
+def fetch_job_postings(company_name: str, domain: str) -> Optional[dict]:
+    if not settings.JSEARCH_API_KEY:
+        logger.info("JSearch key not set — skipping")
+        return None
+
+    query_name = company_name if company_name and company_name != domain else domain.split(".")[0]
+    query = f'"{query_name}" jobs'
+
+    headers = {
+        "X-RapidAPI-Key":  settings.JSEARCH_API_KEY,
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+    }
+    params = {
+        "query":       query,
+        "num_pages":   "2",
+        "date_posted": "month",   # last 30 days
+    }
+
+    try:
+        resp = requests.get(_BASE, headers=headers, params=params, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        logger.warning(f"JSearch request failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f"JSearch returned {resp.status_code}")
+        return None
+
+    jobs = resp.json().get("data", [])
+    if not jobs:
+        return None
+
+    # extract top job functions
+    titles = [j.get("job_title", "") for j in jobs]
+    functions = _classify_functions(titles)
+
+    locations = [
+        j.get("job_city") or j.get("job_country")
+        for j in jobs if j.get("job_city") or j.get("job_country")
+    ]
+    top_locations = [loc for loc, _ in Counter(locations).most_common(3)]
+
+    remote_count = sum(1 for j in jobs if j.get("job_is_remote"))
+
+    return {
+        "posting_count":   len(jobs),
+        "top_functions":   functions,
+        "top_locations":   top_locations,
+        "remote_count":    remote_count,
+        "sample_titles":   titles[:5],
+    }
+
+
+def _classify_functions(titles: list[str]) -> list[str]:
+    """Bucket job titles into broad functions."""
+    buckets: dict[str, int] = {}
+    mapping = {
+        "Engineering":  ["engineer", "developer", "backend", "frontend", "fullstack", "devops", "sre", "architect"],
+        "Sales":        ["sales", "account executive", "ae ", "bdr", "sdr", "revenue"],
+        "Marketing":    ["marketing", "growth", "seo", "content", "brand"],
+        "Product":      ["product manager", "pm ", "product owner"],
+        "Data":         ["data scientist", "data analyst", "data engineer", "ml ", "machine learning"],
+        "Design":       ["designer", "ux", "ui "],
+        "Operations":   ["operations", "ops", "supply chain", "logistics"],
+        "Finance":      ["finance", "accounting", "controller", "cfo"],
+        "HR / People":  ["recruiter", "people ops", "hr ", "talent"],
+        "Customer":     ["customer success", "support", "csm"],
+    }
+    for title in titles:
+        t = title.lower()
+        matched = False
+        for bucket, keywords in mapping.items():
+            if any(k in t for k in keywords):
+                buckets[bucket] = buckets.get(bucket, 0) + 1
+                matched = True
+                break
+        if not matched:
+            buckets["Other"] = buckets.get("Other", 0) + 1
+
+    return [b for b, _ in sorted(buckets.items(), key=lambda x: -x[1]) if b != "Other"][:4]

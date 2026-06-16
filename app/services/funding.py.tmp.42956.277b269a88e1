@@ -1,0 +1,125 @@
+"""
+Crunchbase Basic API collector.
+Fetches organization summary by domain.
+Skips gracefully if CRUNCHBASE_API_KEY is not set.
+
+Crunchbase Basic API docs:
+  GET https://api.crunchbase.com/api/v4/entities/organizations/{permalink}
+  The permalink is typically the company name slug, but we search by domain first.
+"""
+import logging
+from typing import Optional
+from datetime import datetime
+
+import requests
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+_SEARCH_URL = "https://api.crunchbase.com/api/v4/searches/organizations"
+_ENTITY_URL = "https://api.crunchbase.com/api/v4/entities/organizations/{permalink}"
+TIMEOUT = 10
+
+
+def _search_by_domain(domain: str) -> Optional[str]:
+    """Return the org permalink for a given domain, or None."""
+    payload = {
+        "field_ids": ["identifier", "short_description", "website_url"],
+        "predicate_values": [{"field_id": "website_url", "operator_id": "contains", "values": [domain]}],
+        "limit": 1,
+    }
+    params = {"user_key": settings.CRUNCHBASE_API_KEY}
+    try:
+        resp = requests.post(_SEARCH_URL, json=payload, params=params, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        logger.warning(f"Crunchbase search failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f"Crunchbase search returned {resp.status_code}")
+        return None
+
+    entities = resp.json().get("entities", [])
+    if not entities:
+        return None
+
+    return entities[0].get("identifier", {}).get("permalink")
+
+
+def _fetch_org(permalink: str) -> Optional[dict]:
+    fields = [
+        "identifier", "short_description", "founded_on",
+        "funding_total", "last_funding_type", "last_funding_at",
+        "num_funding_rounds", "investor_identifiers",
+        "num_employees_enum", "ipo_status", "categories",
+        "location_identifiers",
+    ]
+    params = {
+        "user_key": settings.CRUNCHBASE_API_KEY,
+        "field_ids": ",".join(fields),
+    }
+    url = _ENTITY_URL.format(permalink=permalink)
+    try:
+        resp = requests.get(url, params=params, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        logger.warning(f"Crunchbase entity fetch failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f"Crunchbase entity returned {resp.status_code}")
+        return None
+
+    return resp.json().get("properties", {})
+
+
+def _months_since(date_str: str) -> Optional[int]:
+    if not date_str:
+        return None
+    try:
+        d = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        delta = datetime.utcnow() - d
+        return delta.days // 30
+    except ValueError:
+        return None
+
+
+def fetch_crunchbase(domain: str) -> Optional[dict]:
+    if not settings.CRUNCHBASE_API_KEY:
+        logger.info("Crunchbase key not set — skipping")
+        return None
+
+    permalink = _search_by_domain(domain)
+    if not permalink:
+        logger.info(f"Crunchbase: no org found for {domain}")
+        return None
+
+    props = _fetch_org(permalink)
+    if not props:
+        return None
+
+    funding_total = props.get("funding_total", {})
+    total_usd = funding_total.get("value_usd") if isinstance(funding_total, dict) else None
+
+    last_funding_at = props.get("last_funding_at")
+    months_since_raise = _months_since(last_funding_at)
+
+    investors = props.get("investor_identifiers", [])
+    investor_names = [i.get("value") for i in investors if i.get("value")][:5]
+
+    categories = props.get("categories", [])
+    category_names = [c.get("value") for c in categories if c.get("value")][:4]
+
+    return {
+        "total_funding_usd":   total_usd,
+        "last_funding_type":   props.get("last_funding_type"),
+        "last_funding_date":   last_funding_at,
+        "months_since_raise":  months_since_raise,
+        "num_funding_rounds":  props.get("num_funding_rounds"),
+        "investors":           investor_names,
+        "employee_range":      props.get("num_employees_enum"),
+        "ipo_status":          props.get("ipo_status"),
+        "founded_on":          props.get("founded_on"),
+        "categories":          category_names,
+        "crunchbase_permalink": permalink,
+    }

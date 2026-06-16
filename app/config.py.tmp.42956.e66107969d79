@@ -1,0 +1,17 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Settings:
+    OPENAI_API_KEY: str    = os.getenv("OPENAI_API_KEY", "")
+    ABSTRACT_API_KEY: str  = os.getenv("ABSTRACT_API_KEY", "")
+    NEWS_API_KEY: str       = os.getenv("NEWS_API_KEY", "")
+    CRUNCHBASE_API_KEY: str = os.getenv("CRUNCHBASE_API_KEY", "")
+    JSEARCH_API_KEY: str    = os.getenv("JSEARCH_API_KEY", "")   # RapidAPI key for JSearch
+    BUILTWITH_API_KEY: str  = os.getenv("BUILTWITH_API_KEY", "")
+    ENVIRONMENT: str        = os.getenv("ENVIRONMENT", "development")
+
+
+settings = Settings()

@@ -1,0 +1,197 @@
+"""
+News collector — two sources, both genuinely free.
+
+Source 1: NewsAPI (https://newsapi.org)
+  - Free developer tier: 100 req/day, articles up to 1 month old.
+  - Good for demos and development. NOT free for production/commercial use.
+  - Env var: NEWS_API_KEY
+  - Label honestly: "dev/demo source"
+
+Source 2: GDELT DOC 2.0 (https://www.gdeltproject.org)
+  - Completely free, forever, no key required.
+  - Indexes worldwide news in near-real-time, 15-min update cycle.
+  - API: https://api.gdeltproject.org/api/v2/doc/doc
+  - Better long-term choice for production use.
+  - Used automatically when NewsAPI key is absent, or as supplement.
+
+Negative keyword detection runs on all results to surface risk signals.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional
+from urllib.parse import quote_plus
+
+import requests
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+TIMEOUT = 10
+
+_NEWSAPI_URL = "https://newsapi.org/v2/everything"
+_GDELT_URL   = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+_NEGATIVE_KEYWORDS = {
+    "lawsuit", "layoffs", "layoff", "breach", "shutdown", "hack",
+    "fraud", "scandal", "controversy", "fine", "penalty", "bankrupt",
+    "insolvency", "investigation", "misconduct", "recall", "closure",
+    "restructuring", "downsizing", "deficit",
+}
+
+_POSITIVE_KEYWORDS = {
+    "raises", "raised", "funding", "growth", "expansion", "launch",
+    "partnership", "acquisition", "award", "milestone", "revenue",
+    "profit", "record", "breakthrough", "innovation",
+}
+
+
+def _score_sentiment(articles: list[dict]) -> str:
+    """Rough sentiment: positive / mixed / negative / neutral."""
+    pos = neg = 0
+    for a in articles:
+        text = ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
+        pos += sum(1 for k in _POSITIVE_KEYWORDS if k in text)
+        neg += sum(1 for k in _NEGATIVE_KEYWORDS if k in text)
+    if neg > pos:
+        return "negative"
+    if pos > neg * 2:
+        return "positive"
+    if pos > 0 or neg > 0:
+        return "mixed"
+    return "neutral"
+
+
+def _detect_negative_flags(articles: list[dict]) -> list[str]:
+    flags = set()
+    for a in articles:
+        text = ((a.get("title") or "") + " " + (a.get("description") or "")).lower()
+        for k in _NEGATIVE_KEYWORDS:
+            if k in text:
+                flags.add(k)
+    return sorted(flags)[:4]
+
+
+# ── NewsAPI ───────────────────────────────────────────────────────────────────
+
+def _fetch_newsapi(query: str) -> Optional[list[dict]]:
+    if not settings.NEWS_API_KEY:
+        return None
+
+    params = {
+        "q":        f'"{query}"',
+        "language": "en",
+        "sortBy":   "publishedAt",
+        "pageSize": 8,
+        "apiKey":   settings.NEWS_API_KEY,
+    }
+    try:
+        resp = requests.get(_NEWSAPI_URL, params=params, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        logger.warning(f"NewsAPI request failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f"NewsAPI returned {resp.status_code}")
+        return None
+
+    return [
+        {
+            "title":        a.get("title"),
+            "source":       a.get("source", {}).get("name"),
+            "published_at": (a.get("publishedAt") or "")[:10],
+            "url":          a.get("url"),
+            "description":  a.get("description"),
+            "news_source":  "NewsAPI",
+        }
+        for a in resp.json().get("articles", [])
+        if a.get("title")
+    ]
+
+
+# ── GDELT ─────────────────────────────────────────────────────────────────────
+
+def _fetch_gdelt(query: str) -> Optional[list[dict]]:
+    """
+    GDELT DOC 2.0 ArtList mode — returns article metadata.
+    No API key. Free forever. Retries once on 429.
+    """
+    params = {
+        "query":      f'"{query}"',
+        "mode":       "artlist",
+        "maxrecords": 10,
+        "format":     "json",
+        "sort":       "DateDesc",
+    }
+    for attempt in range(2):
+        try:
+            resp = requests.get(_GDELT_URL, params=params, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            logger.warning(f"GDELT request failed: {e}")
+            return None
+
+        if resp.status_code == 429:
+            if attempt == 0:
+                import time; time.sleep(3)
+                continue
+            logger.warning("GDELT rate limited after retry")
+            return None
+
+        if resp.status_code != 200:
+            logger.warning(f"GDELT returned {resp.status_code}")
+            return None
+        break
+
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning("GDELT response not JSON")
+        return None
+
+    articles = data.get("articles", [])
+    if not articles:
+        return None
+
+    return [
+        {
+            "title":        a.get("title"),
+            "source":       a.get("domain"),
+            "published_at": (a.get("seendate") or "")[:8],  # GDELT: YYYYMMDDHHMMSS
+            "url":          a.get("url"),
+            "description":  None,   # GDELT artlist doesn't return snippets
+            "news_source":  "GDELT",
+        }
+        for a in articles
+        if a.get("title")
+    ]
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def fetch_news(company_name: str, domain: str) -> Optional[dict]:
+    """
+    Try NewsAPI first (if key set), fall back to GDELT.
+    Both are free; GDELT is the free-forever production choice.
+    """
+    query = company_name if (company_name and company_name != domain) else domain.split(".")[0]
+
+    articles = _fetch_newsapi(query)
+    source_used = "NewsAPI (dev tier)"
+
+    if not articles:
+        articles = _fetch_gdelt(query)
+        source_used = "GDELT"
+
+    if not articles:
+        return None
+
+    sentiment      = _score_sentiment(articles)
+    negative_flags = _detect_negative_flags(articles)
+
+    return {
+        "articles":       articles,
+        "total":          len(articles),
+        "sentiment":      sentiment,
+        "negative_flags": negative_flags,
+        "source":         source_used,
+    }

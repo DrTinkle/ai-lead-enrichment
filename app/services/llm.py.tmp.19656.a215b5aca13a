@@ -1,0 +1,139 @@
+import json
+import logging
+from typing import Optional
+
+from openai import OpenAI
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+def _format_funding(funding: Optional[dict]) -> str:
+    if not funding:
+        return "Not available."
+    lines = []
+    if funding.get("total_funding_usd"):
+        usd = funding["total_funding_usd"]
+        lines.append(f"Total raised: ${usd:,.0f}")
+    if funding.get("last_funding_type"):
+        lines.append(f"Last round: {funding['last_funding_type']}")
+    if funding.get("months_since_raise") is not None:
+        lines.append(f"Months since last raise: {funding['months_since_raise']}")
+    if funding.get("num_funding_rounds"):
+        lines.append(f"Total rounds: {funding['num_funding_rounds']}")
+    if funding.get("investors"):
+        lines.append(f"Key investors: {', '.join(funding['investors'])}")
+    if funding.get("ipo_status"):
+        lines.append(f"IPO status: {funding['ipo_status']}")
+    return "\n".join(lines) if lines else "Not available."
+
+
+def _format_jobs(jobs: Optional[dict]) -> str:
+    if not jobs:
+        return "Not available."
+    lines = [f"Active postings (last 30 days): {jobs.get('posting_count', 0)}"]
+    if jobs.get("top_functions"):
+        lines.append(f"Top hiring areas: {', '.join(jobs['top_functions'])}")
+    if jobs.get("top_locations"):
+        lines.append(f"Hiring locations: {', '.join(jobs['top_locations'])}")
+    if jobs.get("remote_count"):
+        lines.append(f"Remote roles: {jobs['remote_count']}")
+    return "\n".join(lines)
+
+
+def _format_news(news: Optional[dict]) -> str:
+    if not news or not news.get("articles"):
+        return "Not available."
+    lines = []
+    for a in news["articles"]:
+        lines.append(f"- [{a.get('published_at','')}] {a.get('title','')} ({a.get('source','')})")
+    return "\n".join(lines)
+
+
+def _format_techstack(tech: Optional[dict]) -> str:
+    if not tech:
+        return "Not available."
+    lines = [f"Stack signal: {tech.get('stack_signal', 'unknown')} ({tech.get('total_detected', 0)} technologies detected)"]
+    if tech.get("modern_techs"):
+        lines.append(f"Modern tech: {', '.join(tech['modern_techs'])}")
+    if tech.get("legacy_techs"):
+        lines.append(f"Legacy tech: {', '.join(tech['legacy_techs'])}")
+    cats = tech.get("categories", {})
+    for cat, techs in list(cats.items())[:4]:
+        lines.append(f"{cat}: {', '.join(techs)}")
+    return "\n".join(lines)
+
+
+def _format_github(github: Optional[dict]) -> str:
+    if not github:
+        return "Not available."
+    lines = [
+        f"Org: github.com/{github.get('org_login','')}",
+        f"Public repos: {github.get('public_repos', 0)}",
+        f"Total stars: {github.get('total_stars', 0)}",
+        f"Recent commits (90d): {github.get('recent_commits', 0)}",
+        f"Engineering signal: {github.get('eng_signal', 'unknown')}",
+    ]
+    if github.get("top_languages"):
+        lines.append(f"Top languages: {', '.join(github['top_languages'])}")
+    return "\n".join(lines)
+
+
+def analyze_company(
+    company_data: dict,
+    funding: Optional[dict] = None,
+    jobs: Optional[dict] = None,
+    news: Optional[dict] = None,
+    techstack: Optional[dict] = None,
+    github: Optional[dict] = None,
+) -> str:
+    prompt = f"""You are a senior M&A analyst at a technology-focused investment firm.
+
+Analyze the following company using all available signals and return JSON only.
+
+=== COMPANY PROFILE ===
+{json.dumps(company_data, indent=2)}
+
+=== FUNDING & FINANCIALS ===
+{_format_funding(funding)}
+
+=== HIRING SIGNALS (last 30 days) ===
+{_format_jobs(jobs)}
+
+=== RECENT NEWS ===
+{_format_news(news)}
+
+=== TECH STACK ===
+{_format_techstack(techstack)}
+
+=== GITHUB / ENGINEERING PRESENCE ===
+{_format_github(github)}
+
+=== INSTRUCTIONS ===
+Use ALL available signals — not just the website text — to form your assessment.
+Funding trajectory, hiring velocity, news sentiment, and tech stack maturity are strong signals.
+Be specific and direct. Avoid generic statements.
+
+Return a single JSON object with these exact keys:
+- summary: 3-4 sentence analyst-style assessment of the company
+- sector_classification: single sector label
+- maturity_stage: one of Pre-Seed / Seed / Startup / Early Growth / Growth / Scale-Up / Mature / Public
+- acquisition_fit_score: integer 0-10 (10 = exceptional target)
+- growth_signal: one of "strong" / "moderate" / "weak" / "declining" — based on hiring + funding recency
+- tech_assessment: one of "modern" / "mixed" / "legacy" / "unknown"
+- risk_flags: list of up to 4 short, specific risk items
+- positive_signals: list of up to 4 short, specific positive observations
+- reasoning: 2-3 sentence explanation of the acquisition_fit_score
+
+Respond ONLY with valid JSON.
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    return response.choices[0].message.content

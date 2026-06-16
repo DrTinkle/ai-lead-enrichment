@@ -1,0 +1,163 @@
+import json
+import logging
+from typing import Optional
+
+from openai import OpenAI
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+def _format_funding(funding: Optional[dict]) -> str:
+    if not funding:
+        return "Not available."
+    lines = []
+    if funding.get("total_funding_usd"):
+        usd = funding["total_funding_usd"]
+        lines.append(f"Total raised: ${usd:,.0f}")
+    if funding.get("last_funding_type"):
+        lines.append(f"Last round: {funding['last_funding_type']}")
+    if funding.get("months_since_raise") is not None:
+        lines.append(f"Months since last raise: {funding['months_since_raise']}")
+    if funding.get("num_funding_rounds"):
+        lines.append(f"Total rounds: {funding['num_funding_rounds']}")
+    if funding.get("investors"):
+        lines.append(f"Key investors: {', '.join(funding['investors'])}")
+    if funding.get("ipo_status"):
+        lines.append(f"IPO status: {funding['ipo_status']}")
+    return "\n".join(lines) if lines else "Not available."
+
+
+def _format_jobs(jobs: Optional[dict]) -> str:
+    if not jobs:
+        return "Not available."
+    lines = [f"Active postings (last 30 days): {jobs.get('posting_count', 0)}"]
+    if jobs.get("top_functions"):
+        lines.append(f"Top hiring areas: {', '.join(jobs['top_functions'])}")
+    if jobs.get("top_locations"):
+        lines.append(f"Hiring locations: {', '.join(jobs['top_locations'])}")
+    if jobs.get("remote_count"):
+        lines.append(f"Remote roles: {jobs['remote_count']}")
+    return "\n".join(lines)
+
+
+def _format_news(news: Optional[dict]) -> str:
+    if not news or not news.get("articles"):
+        return "Not available."
+    lines = []
+    for a in news["articles"]:
+        lines.append(f"- [{a.get('published_at','')}] {a.get('title','')} ({a.get('source','')})")
+    return "\n".join(lines)
+
+
+def _format_techstack(tech: Optional[dict]) -> str:
+    if not tech:
+        return "Not available."
+    lines = [f"Stack signal: {tech.get('stack_signal', 'unknown')} ({tech.get('total_detected', 0)} technologies detected)"]
+    if tech.get("modern_techs"):
+        lines.append(f"Modern tech: {', '.join(tech['modern_techs'])}")
+    if tech.get("legacy_techs"):
+        lines.append(f"Legacy tech: {', '.join(tech['legacy_techs'])}")
+    cats = tech.get("categories", {})
+    for cat, techs in list(cats.items())[:4]:
+        lines.append(f"{cat}: {', '.join(techs)}")
+    return "\n".join(lines)
+
+
+def _format_github(github: Optional[dict]) -> str:
+    if not github:
+        return "Not available."
+    lines = [
+        f"Org: github.com/{github.get('org_login','')}",
+        f"Public repos: {github.get('public_repos', 0)}",
+        f"Total stars: {github.get('total_stars', 0)}",
+        f"Recent commits (90d): {github.get('recent_commits', 0)}",
+        f"Engineering signal: {github.get('eng_signal', 'unknown')}",
+    ]
+    if github.get("top_languages"):
+        lines.append(f"Top languages: {', '.join(github['top_languages'])}")
+    return "\n".join(lines)
+
+
+def analyze_company(
+    company_data: dict,
+    funding: Optional[dict] = None,
+    jobs: Optional[dict] = None,
+    news: Optional[dict] = None,
+    techstack: Optional[dict] = None,
+    github: Optional[dict] = None,
+) -> str:
+    prompt = f"""You are a senior M&A analyst at a technology-focused investment firm.
+
+Analyze the following company using all available signals and return JSON only.
+
+=== COMPANY PROFILE ===
+{json.dumps(company_data, indent=2)}
+
+=== FUNDING & FINANCIALS ===
+{_format_funding(funding)}
+
+=== HIRING SIGNALS (last 30 days) ===
+{_format_jobs(jobs)}
+
+=== RECENT NEWS ===
+{_format_news(news)}
+
+=== TECH STACK ===
+{_format_techstack(techstack)}
+
+=== GITHUB / ENGINEERING PRESENCE ===
+{_format_github(github)}
+
+=== INSTRUCTIONS ===
+You are writing a detailed acquisition intelligence report. Use ALL available signals.
+Be specific — cite actual data points (funding amounts, job counts, tech names, GitHub stats).
+Never write generic filler like "the company shows promise." Reference the evidence.
+
+Return a single JSON object with these exact keys:
+
+- summary: 4-5 sentence executive summary. Mention sector, stage, key strengths, and any red flags.
+
+- sector_classification: single sector label
+
+- maturity_stage: one of Pre-Seed / Seed / Startup / Early Growth / Growth / Scale-Up / Mature / Public
+
+- acquisition_fit_score: integer 0-10 (10 = exceptional target)
+
+- growth_signal: one of "strong" / "moderate" / "weak" / "declining"
+  Base this on: hiring velocity, funding recency, news volume, GitHub commit activity.
+
+- tech_assessment: one of "modern" / "mixed" / "legacy" / "unknown"
+
+- risk_flags: list of up to 5 specific risks. Each must cite a data source or observation.
+  Example: "Only 3 job postings in 30 days suggests stalled growth" not "growth risk".
+
+- positive_signals: list of up to 5 specific positives, each citing evidence.
+  Example: "Series B raised 8 months ago signals active VC backing" not "well funded".
+
+- funding_outlook: 2-3 sentence paragraph. Assess the funding situation using EDGAR/news data.
+  If no funding data: note the gap and what it implies. Be honest about data limitations.
+
+- hiring_health: 2-3 sentence paragraph. Analyse hiring signals — volume, function mix, ATS presence.
+  What does the hiring pattern reveal about growth trajectory and team composition?
+
+- tech_maturity: 2-3 sentence paragraph. Assess tech stack from detected technologies and GitHub.
+  Address integration risk, engineering depth, and modernisation cost for an acquirer.
+
+- market_position: 2-3 sentence paragraph. Based on news coverage, sector, product signals from website,
+  and competitive context — where does this company sit in its market?
+
+- reasoning: 2-3 sentence explanation of why you gave this acquisition_fit_score, citing the top 2-3 factors.
+
+Respond ONLY with valid JSON.
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    return response.choices[0].message.content

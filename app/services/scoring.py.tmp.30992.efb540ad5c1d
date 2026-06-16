@@ -1,0 +1,91 @@
+from difflib import SequenceMatcher
+from app.utils.helpers import clamp_score
+
+
+def _fuzzy_match(value: str | None, candidates: list[str], threshold: float = 0.75) -> bool:
+    """Return True if value fuzzy-matches any candidate at or above threshold."""
+    if not value or not candidates:
+        return False
+    v = value.lower().strip()
+    for c in candidates:
+        c_lower = c.lower().strip()
+        # substring containment (e.g. "fintech" inside "financial technology / fintech")
+        if v in c_lower or c_lower in v:
+            return True
+        ratio = SequenceMatcher(None, v, c_lower).ratio()
+        if ratio >= threshold:
+            return True
+    return False
+
+
+def apply_acquisition_scoring(
+    company: dict,
+    analysis: dict,
+    preferred_sectors=None,
+    preferred_regions=None,
+    preferred_maturity=None,
+    weight_ai=0.6,
+    weight_rules=0.4
+):
+    # fallback safety
+    preferred_sectors = preferred_sectors or []
+    preferred_regions = preferred_regions or []
+    preferred_maturity = preferred_maturity or []
+
+    adjustments = []
+
+    # --- AI score ---
+    ai_score = analysis.get("acquisition_fit_score", 0)
+
+    # --- Rule score calculation ---
+    rule_score = 0
+
+    sector = analysis.get("sector_classification")
+    location = company.get("location")
+    maturity = analysis.get("maturity_stage")
+    risks = analysis.get("risk_flags", [])
+
+    # sector match (fuzzy)
+    if _fuzzy_match(sector, preferred_sectors):
+        rule_score += 3
+        adjustments.append(f"Sector match +3 ('{sector}')")
+    else:
+        adjustments.append(f"Sector mismatch +0 ('{sector}')")
+
+    # region match (fuzzy)
+    if _fuzzy_match(location, preferred_regions):
+        rule_score += 2
+        adjustments.append(f"Region match +2 ('{location}')")
+    else:
+        adjustments.append(f"Region mismatch +0 ('{location}')")
+
+    # maturity match (fuzzy)
+    if _fuzzy_match(maturity, preferred_maturity):
+        rule_score += 2
+        adjustments.append(f"Maturity match +2 ('{maturity}')")
+    else:
+        adjustments.append(f"Maturity mismatch +0 ('{maturity}')")
+
+    # risk penalty
+    risk_penalty = min(len(risks), 3)
+    if risk_penalty:
+        rule_score -= risk_penalty
+        adjustments.append(f"Risk penalty -{risk_penalty}")
+
+    # normalize rule score to 0-10 range
+    rule_score = max(0, min(rule_score, 10))
+
+    # --- weighted blend ---
+    final_score = round(
+        (ai_score * weight_ai) + (rule_score * weight_rules),
+        2
+    )
+
+    return {
+        "ai_score": ai_score,
+        "rule_score": rule_score,
+        "final_score": final_score,
+        "weight_ai": weight_ai,
+        "weight_rules": weight_rules,
+        "adjustments": adjustments,
+    }

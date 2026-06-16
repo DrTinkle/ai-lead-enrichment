@@ -1,0 +1,128 @@
+"""
+BuiltWith API collector.
+Returns categorized tech stack for a domain.
+Skips gracefully if BUILTWITH_API_KEY is not set.
+"""
+import logging
+from typing import Optional
+
+import requests
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+_BASE = "https://api.builtwith.com/v21/api.json"
+TIMEOUT = 10
+
+# Map BuiltWith category names → our cleaner labels
+_CATEGORY_MAP = {
+    "Analytics and Tracking":  "Analytics",
+    "Widgets":                 "Widgets",
+    "Frameworks":              "Frameworks",
+    "Content Management":      "CMS",
+    "eCommerce":               "eCommerce",
+    "Payment":                 "Payments",
+    "CDN":                     "CDN",
+    "Hosting":                 "Hosting",
+    "Web Servers":             "Web Server",
+    "SSL Certificates":        "SSL",
+    "JavaScript Frameworks":   "JS Framework",
+    "UI Frameworks":           "UI Framework",
+    "Tag Management":          "Tag Management",
+    "Marketing Automation":    "Marketing Automation",
+    "CRM":                     "CRM",
+    "Live Chat":               "Live Chat",
+    "Customer Support":        "Support",
+    "Security":                "Security",
+    "Mobile":                  "Mobile",
+    "Database":                "Database",
+}
+
+# Tech names that signal engineering sophistication
+_MODERN_SIGNALS = {
+    "react", "next.js", "vue", "angular", "svelte",
+    "kubernetes", "docker", "aws", "gcp", "azure",
+    "terraform", "datadog", "segment", "snowflake",
+    "graphql", "fastapi", "stripe",
+}
+_LEGACY_SIGNALS = {
+    "jquery", "wordpress", "joomla", "drupal",
+    "php", "coldfusion", "asp.net", "classic asp",
+    "internet explorer", "flash",
+}
+
+
+def fetch_builtwith(domain: str) -> Optional[dict]:
+    if not settings.BUILTWITH_API_KEY:
+        logger.info("BuiltWith key not set — skipping")
+        return None
+
+    params = {
+        "KEY":    settings.BUILTWITH_API_KEY,
+        "LOOKUP": domain,
+    }
+
+    try:
+        resp = requests.get(_BASE, params=params, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        logger.warning(f"BuiltWith request failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f"BuiltWith returned {resp.status_code}")
+        return None
+
+    data = resp.json()
+    results = data.get("Results", [])
+    if not results:
+        return None
+
+    paths = results[0].get("Result", {}).get("Paths", [])
+    if not paths:
+        return None
+
+    # flatten all technologies across paths
+    all_techs: list[dict] = []
+    for path in paths:
+        for tech in path.get("Technologies", []):
+            all_techs.append(tech)
+
+    if not all_techs:
+        return None
+
+    # group by category
+    categories: dict[str, list[str]] = {}
+    tech_names: list[str] = []
+    for tech in all_techs:
+        raw_cat = tech.get("Categories", ["Other"])[0] if tech.get("Categories") else "Other"
+        cat = _CATEGORY_MAP.get(raw_cat, raw_cat)
+        name = tech.get("Name", "")
+        if name:
+            tech_names.append(name)
+            categories.setdefault(cat, [])
+            if name not in categories[cat]:
+                categories[cat].append(name)
+
+    # score modernity
+    names_lower = {n.lower() for n in tech_names}
+    modern_hits = [t for t in _MODERN_SIGNALS if t in names_lower]
+    legacy_hits = [t for t in _LEGACY_SIGNALS if t in names_lower]
+
+    if len(modern_hits) >= 3 and not legacy_hits:
+        stack_signal = "modern"
+    elif legacy_hits:
+        stack_signal = "legacy"
+    else:
+        stack_signal = "mixed"
+
+    # keep top categories only (cap list length)
+    summarized = {cat: techs[:4] for cat, techs in list(categories.items())[:8]}
+
+    return {
+        "categories":    summarized,
+        "stack_signal":  stack_signal,
+        "modern_techs":  modern_hits,
+        "legacy_techs":  legacy_hits,
+        "total_detected": len(tech_names),
+    }

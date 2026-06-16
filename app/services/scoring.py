@@ -1,73 +1,323 @@
-from app.utils.helpers import clamp_score
+from __future__ import annotations
+from difflib import SequenceMatcher
+
+
+def _fuzzy_match(value, candidates, threshold=0.75):
+    if not value or not candidates:
+        return False
+    v = value.lower().strip()
+    for c in candidates:
+        cl = c.lower().strip()
+        if v in cl or cl in v:
+            return True
+        if SequenceMatcher(None, v, cl).ratio() >= threshold:
+            return True
+    return False
+
+
+def _bucket(value, tiers):
+    """
+    tiers = [(threshold, points), ...] sorted descending.
+    Returns points for the first tier where value >= threshold.
+    """
+    for threshold, pts in tiers:
+        if value >= threshold:
+            return pts
+    return 0.0
+
 
 def apply_acquisition_scoring(
-    company: dict,
-    analysis: dict,
-    preferred_sectors=None,
-    preferred_regions=None,
-    preferred_maturity=None,
-    weight_ai=0.6,
-    weight_rules=0.4
+    company, analysis,
+    preferred_sectors=None, preferred_regions=None, preferred_maturity=None,
+    weight_ai=0.6, weight_rules=0.4,
+    funding=None, jobs=None, news=None, techstack=None, github=None, financials=None,
 ):
-    # fallback safety
-    preferred_sectors = preferred_sectors or []
-    preferred_regions = preferred_regions or []
+    preferred_sectors  = preferred_sectors  or []
+    preferred_regions  = preferred_regions  or []
     preferred_maturity = preferred_maturity or []
 
-    adjustments = []
+    adjustments  = []
+    # Start at 5.0 — missing data is neutral, not penalised
+    rule_score   = 5.0
+    growth_pts   = 0.0   # tracks growth-oriented signals
+    quality_pts  = 0.0   # tracks quality/stability signals
+    risk_pts     = 0.0   # tracks risk deductions
+    signals_found   = 0  # how many sources returned data
+    evidence_count  = 0  # total data points seen
 
-    # --- AI score ---
-    ai_score = analysis.get("acquisition_fit_score", 0)
-
-    # --- Rule score calculation ---
-    rule_score = 0
-
-    sector = analysis.get("sector_classification")
+    sector   = analysis.get("sector_classification")
     location = company.get("location")
     maturity = analysis.get("maturity_stage")
-    risks = analysis.get("risk_flags", [])
+    risks    = analysis.get("risk_flags", [])
+    positives = analysis.get("positive_signals", [])
 
-    # sector match
-    if sector in preferred_sectors:
-        rule_score += 3
-        adjustments.append("Sector match +3")
+    # ── 1. Thesis match  (max ±2.0) ──────────────────────────────────────────
+    any_sector   = any(s.lower().startswith("any") for s in preferred_sectors)
+    any_region   = any(r.lower().startswith("any") for r in preferred_regions)
+    any_maturity = any(m.lower().startswith("any") for m in preferred_maturity)
+
+    if any_sector:
+        rule_score += 1.0; quality_pts += 1.0
+        adjustments.append({"label": "Sector: any (no filter)", "pts": 1.0, "group": "Thesis"})
+    elif _fuzzy_match(sector, preferred_sectors):
+        rule_score += 1.0; quality_pts += 1.0
+        adjustments.append({"label": f"Sector match ({sector})", "pts": 1.0, "group": "Thesis"})
     else:
-        adjustments.append("Sector mismatch +0")
+        adjustments.append({"label": f"Sector mismatch ({sector or '--'})", "pts": 0, "group": "Thesis"})
 
-    # region match
-    if location in preferred_regions:
-        rule_score += 2
-        adjustments.append("Region match +2")
+    if any_region:
+        rule_score += 0.5; quality_pts += 0.5
+        adjustments.append({"label": "Region: any (no filter)", "pts": 0.5, "group": "Thesis"})
+    elif _fuzzy_match(location, preferred_regions):
+        rule_score += 0.5; quality_pts += 0.5
+        adjustments.append({"label": f"Region match ({location})", "pts": 0.5, "group": "Thesis"})
     else:
-        adjustments.append("Region mismatch +0")
+        adjustments.append({"label": f"Region mismatch ({location or '--'})", "pts": 0, "group": "Thesis"})
 
-    # maturity match
-    if maturity in preferred_maturity:
-        rule_score += 2
-        adjustments.append("Maturity match +2")
+    if any_maturity:
+        rule_score += 0.5; quality_pts += 0.5
+        adjustments.append({"label": "Maturity: any (no filter)", "pts": 0.5, "group": "Thesis"})
+    elif _fuzzy_match(maturity, preferred_maturity):
+        rule_score += 0.5; quality_pts += 0.5
+        adjustments.append({"label": f"Maturity match ({maturity})", "pts": 0.5, "group": "Thesis"})
     else:
-        adjustments.append("Maturity mismatch +0")
+        adjustments.append({"label": f"Maturity mismatch ({maturity or '--'})", "pts": 0, "group": "Thesis"})
 
-    # risk penalty
-    risk_penalty = min(len(risks), 3)
-    if risk_penalty:
-        rule_score -= risk_penalty
-        adjustments.append(f"Risk penalty -{risk_penalty}")
+    # ── 2. Funding  (max +2.0, missing = neutral) ────────────────────────────
+    if funding:
+        signals_found += 1
+        months     = funding.get("months_since_raise")
+        round_type = (funding.get("last_funding_type") or "").lower()
+        total      = funding.get("total_funding_usd") or 0
 
-    # normalize rule score to 0-10 range
-    rule_score = max(0, min(rule_score, 10))
+        if months is not None:
+            evidence_count += 1
+            pts = _bucket(1, [(1, 1.0)]) if months <= 12 else \
+                  _bucket(1, [(1, 0.5)]) if months <= 24 else 0.0
+            if months <= 12:
+                pts = 1.0; rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Recent raise ({months}mo ago)", "pts": pts, "group": "Funding"})
+            elif months <= 24:
+                pts = 0.5; rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Raise within 2yr ({months}mo ago)", "pts": pts, "group": "Funding"})
+            else:
+                adjustments.append({"label": f"Last raise {months}mo ago", "pts": 0, "group": "Funding"})
 
-    # --- weighted blend ---
-    final_score = round(
-        (ai_score * weight_ai) + (rule_score * weight_rules),
-        2
-    )
+        if any(r in round_type for r in ["series b","series c","series d","growth","late"]):
+            pts = 0.75; rule_score += pts; quality_pts += pts
+            adjustments.append({"label": f"Institutional round ({funding['last_funding_type']})", "pts": pts, "group": "Funding"})
+        elif any(r in round_type for r in ["series a","seed"]):
+            pts = 0.25; rule_score += pts; growth_pts += pts
+            adjustments.append({"label": f"Early-stage round ({funding['last_funding_type']})", "pts": pts, "group": "Funding"})
+
+        if total >= 50_000_000:
+            pts = 0.25; rule_score += pts; quality_pts += pts
+            adjustments.append({"label": f"Significant capital raised (${total/1e6:.0f}M)", "pts": pts, "group": "Funding"})
+        if total:
+            evidence_count += 1
+    else:
+        # Missing funding data — neutral, noted but no deduction
+        adjustments.append({"label": "Funding data unavailable — not penalised", "pts": 0, "group": "Funding"})
+
+    # ── 3. Hiring velocity  (max +2.0, gated on entity confidence) ──────────
+    if jobs:
+        signals_found += 1
+        count    = jobs.get("posting_count", 0)
+        job_conf = jobs.get("confidence", 1.0)
+        evidence_count += count
+
+        if job_conf >= 0.70:
+            pts = _bucket(count, [(30, 2.0), (10, 1.5), (4, 1.0), (1, 0.5)])
+            if pts > 0:
+                rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Hiring velocity ({count} postings, {job_conf:.0%} confidence)", "pts": pts, "group": "Hiring"})
+            else:
+                adjustments.append({"label": "Minimal open roles", "pts": 0, "group": "Hiring"})
+        elif job_conf >= 0.40:
+            pts = round(_bucket(count, [(30, 2.0), (10, 1.5), (4, 1.0), (1, 0.5)]) * 0.5, 2)
+            if pts > 0:
+                rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Hiring signal — partial credit (low confidence {job_conf:.0%})", "pts": pts, "group": "Hiring"})
+            else:
+                adjustments.append({"label": f"Minimal hiring (low confidence {job_conf:.0%})", "pts": 0, "group": "Hiring"})
+        else:
+            adjustments.append({"label": f"Job postings discarded — entity confidence too low ({job_conf:.0%})", "pts": 0, "group": "Hiring"})
+    else:
+        adjustments.append({"label": "Job data unavailable — not penalised", "pts": 0, "group": "Hiring"})
+
+    # ── 4. Tech stack  (max +1.5, missing = neutral) ─────────────────────────
+    if techstack:
+        signals_found += 1
+        detected = techstack.get("total_detected", 0)
+        evidence_count += detected
+        signal = techstack.get("stack_signal", "unknown")
+        if signal == "modern":
+            pts = 1.5; rule_score += pts; quality_pts += pts
+            adjustments.append({"label": f"Modern tech stack ({detected} technologies)", "pts": pts, "group": "Tech"})
+        elif signal == "mixed":
+            pts = 0.75; rule_score += pts; quality_pts += pts
+            adjustments.append({"label": f"Mixed tech stack ({detected} technologies)", "pts": pts, "group": "Tech"})
+        elif signal == "legacy":
+            pts = -0.5; rule_score += pts; risk_pts += abs(pts)
+            adjustments.append({"label": "Legacy tech stack", "pts": pts, "group": "Tech"})
+        else:
+            adjustments.append({"label": "Tech stack signal unclear", "pts": 0, "group": "Tech"})
+    else:
+        adjustments.append({"label": "Tech stack unavailable — not penalised", "pts": 0, "group": "Tech"})
+
+    # ── 5. GitHub  (max +1.5, missing = neutral) ─────────────────────────────
+    if github:
+        signals_found += 1
+        stars   = github.get("total_stars", 0)
+        commits = github.get("recent_commits", 0)
+        evidence_count += github.get("public_repos", 0)
+        evidence_count += commits
+        eng = github.get("eng_signal", "none")
+        if eng == "strong":
+            pts = 1.5; rule_score += pts; quality_pts += pts
+            adjustments.append({"label": f"Strong engineering ({stars:,} stars, {commits} recent commits)", "pts": pts, "group": "GitHub"})
+        elif eng == "moderate":
+            pts = 0.75; rule_score += pts; quality_pts += pts
+            adjustments.append({"label": f"Moderate GitHub presence ({github.get('public_repos',0)} repos)", "pts": pts, "group": "GitHub"})
+        elif eng == "light":
+            pts = 0.25; rule_score += pts; quality_pts += pts
+            adjustments.append({"label": "Light GitHub presence", "pts": pts, "group": "GitHub"})
+        else:
+            adjustments.append({"label": "No GitHub org found — not penalised", "pts": 0, "group": "GitHub"})
+    else:
+        adjustments.append({"label": "GitHub data unavailable — not penalised", "pts": 0, "group": "GitHub"})
+
+    # ── 6. Public financials  (max +2.0, missing = neutral) ──────────────────
+    if financials and financials.get("is_public"):
+        signals_found += 1
+        evidence_count += 5  # several financial metrics = rich evidence
+        rev_growth  = financials.get("revenue_growth")
+        op_margin   = financials.get("operating_margin")
+        analyst_rec = (financials.get("analyst_recommendation") or "").lower()
+
+        if rev_growth is not None:
+            if rev_growth >= 0.20:
+                pts = 1.0; rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Strong revenue growth ({rev_growth*100:.1f}% YoY)", "pts": pts, "group": "Financials"})
+            elif rev_growth >= 0.05:
+                pts = 0.5; rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Moderate revenue growth ({rev_growth*100:.1f}% YoY)", "pts": pts, "group": "Financials"})
+            elif rev_growth < 0:
+                pts = -0.5; rule_score += pts; risk_pts += abs(pts)
+                adjustments.append({"label": f"Revenue declining ({rev_growth*100:.1f}% YoY)", "pts": pts, "group": "Financials"})
+
+        if op_margin is not None:
+            if op_margin >= 0.15:
+                pts = 0.5; rule_score += pts; quality_pts += pts
+                adjustments.append({"label": f"Healthy operating margin ({op_margin*100:.1f}%)", "pts": pts, "group": "Financials"})
+            elif op_margin < -0.10:
+                pts = -0.5; rule_score += pts; risk_pts += abs(pts)
+                adjustments.append({"label": f"Deep operating losses ({op_margin*100:.1f}%)", "pts": pts, "group": "Financials"})
+
+        if analyst_rec in {"buy", "strong buy"}:
+            pts = 0.25; rule_score += pts; quality_pts += pts
+            adjustments.append({"label": f"Analyst consensus: {analyst_rec.title()}", "pts": pts, "group": "Financials"})
+        elif analyst_rec in {"sell", "strong sell", "underperform"}:
+            pts = -0.25; rule_score += pts; risk_pts += abs(pts)
+            adjustments.append({"label": f"Analyst consensus: {analyst_rec.title()}", "pts": pts, "group": "Financials"})
+        else:
+            adjustments.append({"label": f"Public company — ticker {financials.get('ticker')}", "pts": 0, "group": "Financials"})
+    else:
+        adjustments.append({"label": "Private company — no public financials (neutral)", "pts": 0, "group": "Financials"})
+
+    # ── 7. News & sentiment  (max +1.5) ──────────────────────────────────────
+    if news and news.get("articles"):
+        signals_found += 1
+        count = len(news["articles"])
+        evidence_count += count
+        na = news.get("analysis") or {}
+        news_score = na.get("overall_news_score")
+        risk_sig   = na.get("risk_signal") or 0
+
+        if news_score is not None:
+            if news_score >= 7:
+                pts = 1.5; rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Strong news coverage (AI score {news_score:.1f})", "pts": pts, "group": "News"})
+            elif news_score >= 5:
+                pts = 0.75; rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Positive news coverage (AI score {news_score:.1f})", "pts": pts, "group": "News"})
+            elif news_score >= 3:
+                pts = 0.25; rule_score += pts
+                adjustments.append({"label": f"Mixed news coverage (AI score {news_score:.1f})", "pts": pts, "group": "News"})
+            else:
+                pts = -0.25; rule_score += pts; risk_pts += abs(pts)
+                adjustments.append({"label": f"Negative news coverage (AI score {news_score:.1f})", "pts": pts, "group": "News"})
+
+            if risk_sig >= 7:
+                pts = -1.0; rule_score += pts; risk_pts += abs(pts)
+                adjustments.append({"label": f"High news risk signal ({risk_sig:.1f}/10)", "pts": pts, "group": "News"})
+            elif risk_sig >= 5:
+                pts = -0.5; rule_score += pts; risk_pts += abs(pts)
+                adjustments.append({"label": f"Moderate news risk ({risk_sig:.1f}/10)", "pts": pts, "group": "News"})
+        else:
+            # No AI analysis — bucket by volume
+            pts = _bucket(count, [(10, 1.0), (4, 0.75), (1, 0.25)])
+            if pts:
+                rule_score += pts; growth_pts += pts
+                adjustments.append({"label": f"Press coverage ({count} articles)", "pts": pts, "group": "News"})
+    else:
+        adjustments.append({"label": "No news coverage found — not penalised", "pts": 0, "group": "News"})
+
+    # ── 8. Positive signals bonus  (max +0.5) ────────────────────────────────
+    pos_count = len(positives)
+    evidence_count += pos_count
+    if pos_count >= 4:
+        pts = 0.5; rule_score += pts; growth_pts += pts
+        adjustments.append({"label": f"{pos_count} positive signals identified", "pts": pts, "group": "Signals"})
+    elif pos_count >= 2:
+        pts = 0.25; rule_score += pts; growth_pts += pts
+        adjustments.append({"label": f"{pos_count} positive signals identified", "pts": pts, "group": "Signals"})
+
+    # ── 9. Risk penalty from LLM flags  (max -2.0) ───────────────────────────
+    if risks:
+        evidence_count += len(risks)
+        penalty = min(len(risks) * 0.4, 2.0)
+        rule_score -= penalty; risk_pts += penalty
+        adjustments.append({"label": f"{len(risks)} risk flag(s) from AI analysis", "pts": -round(penalty,2), "group": "Risk"})
+
+    # ── Normalise rule_score to 0-10 ─────────────────────────────────────────
+    rule_score = round(max(0.0, min(rule_score, 10.0)), 2)
+
+    # ── Confidence  (% of possible data sources that returned data) ───────────
+    # Sources: abstractapi/website (always run), news, funding, jobs, techstack, github, financials
+    data_sources_possible = 6  # news, funding, jobs, techstack, github, financials
+    confidence = round(signals_found / data_sources_possible, 2)
+    confidence_pct = round(confidence * 100)
+    if confidence_pct >= 70:
+        confidence_label = "High"
+    elif confidence_pct >= 40:
+        confidence_label = "Medium"
+    else:
+        confidence_label = "Low"
+
+    # ── Sub-scores ────────────────────────────────────────────────────────────
+    ai_score    = analysis.get("acquisition_fit_score", 0)
+    final_score = round((ai_score * weight_ai) + (rule_score * weight_rules), 2)
+
+    # Growth score: 0-10, based on growth signals relative to max possible
+    growth_score = round(min((growth_pts / 5.0) * 10, 10.0), 1)
+    # Quality score: 0-10, based on quality signals
+    quality_score = round(min((quality_pts / 5.0) * 10, 10.0), 1)
+    # Risk score: 0-10 (higher = riskier)
+    risk_score = round(min((risk_pts / 4.0) * 10, 10.0), 1)
 
     return {
-        "ai_score": ai_score,
-        "rule_score": rule_score,
-        "final_score": final_score,
-        "weight_ai": weight_ai,
-        "weight_rules": weight_rules,
-        "adjustments": adjustments,
+        "ai_score":         ai_score,
+        "rule_score":       rule_score,
+        "final_score":      final_score,
+        "weight_ai":        weight_ai,
+        "weight_rules":     weight_rules,
+        "adjustments":      adjustments,
+        "confidence":       confidence,
+        "confidence_pct":   confidence_pct,
+        "confidence_label": confidence_label,
+        "evidence_count":   evidence_count,
+        "growth_score":     growth_score,
+        "quality_score":    quality_score,
+        "risk_score":       risk_score,
     }

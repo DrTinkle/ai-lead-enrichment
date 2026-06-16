@@ -157,12 +157,9 @@ def fetch_company_site_signal(input_value: str) -> Optional[dict]:
                 "meta_description": parts["meta_description"],
                 "text":             parts["text"],
                 # pass raw HTML through for tech-stack self-detection
-                  "raw_html": html,
+                "raw_html":         html if label == "homepage" else "",
             }
         )
-
-    return {"pages": extracted_pages}
-
 
     return {
         "domain": domain,

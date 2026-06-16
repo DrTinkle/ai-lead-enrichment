@@ -1,171 +1,99 @@
-# AI-Powered Lead / Company Enrichment Tool
+# Acquisition Intelligence Tool
 
-### Live Demo
-
-A live version of the application is available at:  
-[https://ai-lead-enrichment.streamlit.app/](https://ai-lead-enrichment.streamlit.app/)
-
-## Overview
-
-This project is a Python-based lead enrichment and acquisition screening tool.
-
-It takes a company domain as input, gathers publicly available signals, enriches the data using an LLM, and evaluates the company against a configurable acquisition thesis.
-
-The result is a structured analysis including:
-
-- Company overview  
-- AI-generated summary and classification  
-- Deterministic rule-based scoring  
-- Weighted blended final score  
-- Transparent scoring breakdown  
-
-The goal is to simulate a lightweight acquisition evaluation engine.
+A Streamlit-based company screening tool for evaluating acquisition targets. Enter a company domain, configure a thesis, and get a scored analysis drawn from live data across six signal sources.
 
 ---
 
-## Problem Statement
+## What It Does
 
-Acquisition teams often evaluate companies using a mix of:
+1. **Enriches** the company from public sources (website, jobs, news, GitHub, funding, financials)
+2. **Analyzes** signals with GPT-4o to produce a narrative and structured flags
+3. **Scores** the company 0–10 against a configurable acquisition thesis
+4. **Surfaces** evidence - clickable news articles, job postings with URLs, tech stack, funding signals
 
-- Public company information  
-- Strategic alignment  
-- Growth indicators  
-- Risk signals  
-- Internal investment thesis  
+---
 
-This project demonstrates how such a workflow can be partially automated using:
+## Signal Sources
 
-- API integrations  
-- Web scraping  
-- LLM-based analysis  
-- Rule-based scoring logic  
-- Weighted decision modeling  
+| Source | What it captures |
+|---|---|
+| **Website scraping** | Company description, tech stack detected from HTML |
+| **Adzuna + careers page** | Job volume, role types, hiring signals; entity-resolved per posting |
+| **NewsAPI** | Recent news (28-day window), relevance-scored, AI-classified |
+| **GDELT** | Broader news fallback (free, no key); disabled via `GDELT_ENABLED=false` |
+| **GitHub API** | Repo count, stars, recent commit activity |
+| **SEC EDGAR + scraping** | Funding signals, revenue indicators |
+
+---
+
+## Scoring Model
+
+- **Base score**: 5.0 (neutral — missing data is not penalized)
+- **Bucket scoring** with diminishing returns for jobs, news, GitHub activity
+- **Confidence %**: signals found out of 6 possible sources
+- **Sub-scores**: Growth, Quality, Risk (displayed as bars)
+- **Thesis alignment**: sector, region, maturity stage, ARR range
+
+Hiring signals are gated on job confidence (>=0.70 full weight, 0.40-0.70 half, <0.40 discarded).
+
+---
+
+## Running Locally
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+---
+
+## Environment Variables
+
+```
+OPENAI_API_KEY=...          # Required
+ABSTRACT_API_KEY=...        # Optional - company metadata
+NEWS_API_KEY=...            # Optional - primary news source
+ADZUNA_APP_ID=...           # Optional - job postings
+ADZUNA_APP_KEY=...          # Optional - job postings
+GITHUB_TOKEN=...            # Optional - higher GitHub rate limit
+GDELT_ENABLED=false         # Set to disable GDELT if rate-limited
+```
 
 ---
 
 ## Architecture
 
-### 1. Data Collection Layer
-
-- Domain normalization  
-- Optional enrichment via AbstractAPI  
-- Website scraping (homepage + common company pages)  
-- HTML parsing with BeautifulSoup  
-- Text cleaning and truncation  
-
-### 2. AI Enrichment Layer
-
-Uses OpenAI to generate structured company analysis.
-
-The LLM returns strict JSON containing:
-
-- `summary`
-- `sector_classification`
-- `maturity_stage`
-- `acquisition_fit_score`
-- `risk_flags`
-- `reasoning`
-
-The system enforces JSON-only responses.
-
-### 3. Scoring Engine
-
-The tool uses a **blended weighted model**.
-
-Two independent signals are calculated:
-
-1. **AI Score** (0–10)  
-2. **Rule Score** (0–10, thesis alignment)
-
-Rule score considers:
-
-- Sector match (+3)
-- Region match (+2)
-- Maturity match (+2)
-- Risk penalties (−1 per risk, max −3)
-
-Final score is calculated as:
-Final Score = (AI Score × weight_ai) + (Rule Score × weight_rules)
-
-### Default Weights
-
-weight_ai = 0.6  
-weight_rules = 0.4  
-
-The UI displays:
-
-- AI Score  
-- Rule Score  
-- Final Score  
-- Full weighted formula breakdown  
-- Rule adjustment explanations  
-
-### Running Locally
-
-Install dependencies:
-
-pip install -r requirements.txt  
-
-Run the app:
-
-streamlit run streamlit_app.py  
+```
+streamlit_app.py            # UI - tabs: Analysis, Evidence, Scoring
+app/
+  config.py                 # Settings loaded from .env
+  models.py                 # Pydantic schemas
+  services/
+    enrichment.py           # Orchestrates all collectors
+    scoring.py              # Deterministic scoring engine
+    llm.py                  # GPT-4o narrative + structured analysis
+    news.py                 # NewsAPI primary, GDELT fallback, daily cache
+    news_analysis.py        # GPT-4o-mini per-article sentiment + signals
+    jobs.py                 # Adzuna + careers page, entity resolution
+    github.py               # GitHub API
+    funding.py              # SEC EDGAR + funding signals
+    financials.py           # Public company financial data
+    techstack.py            # Tech stack detected from website HTML
+    cache.py                # File-based daily cache
+```
 
 ---
 
-### Environment Variables
+## News System
 
-OPENAI_API_KEY=your_key_here  
-ABSTRACT_API_KEY=your_key_here (optional)  
+- **Primary**: NewsAPI with 28-day window, relevance-scored (name in title +40, description +25, trusted source +10, recency boost)
+- **Fallback**: GDELT DOC 2.0 API, single query with exponential backoff, triggered only if NewsAPI returns fewer than 5 articles
+- **AI analysis**: GPT-4o-mini classifies each article — sentiment, business impact, confidence, signal tags, risk flags
+- **Cache**: results cached daily per company in `.cache/news/`
 
----
+## Jobs System
 
-### Deployment
-
-Deployed on Railway as a Python service running Streamlit.
-
----
-
-### Technical Highlights
-
-- Python 3.11+  
-- Pydantic schema validation  
-- OpenAI structured JSON responses  
-- Weighted blended scoring engine  
-- Deterministic rule-based adjustments  
-- API cost control via caching  
-- Modular architecture  
-
----
-
-### Limitations
-
-- Depends on website content quality  
-- AI output may vary slightly  
-- Rule scoring uses deterministic matching  
-- File-based cache is not persistent on ephemeral hosts  
-
----
-
-### Future Improvements
-
-- SQLite persistence layer  
-- Adjustable scoring weights in UI  
-- Batch CSV processing  
-- Export results to CSV  
-- Multi-company comparison view  
-- Risk severity weighting  
-- Authentication layer  
-
----
-
-### Purpose
-
-This project demonstrates:
-
-- API integration  
-- Data structuring  
-- Practical LLM usage  
-- Rule-based scoring logic  
-- Business-aware automation  
-
-- Clean modular architecture  
+- Adzuna exact-phrase search + careers page scraping
+- Per-posting entity resolution score (name similarity, domain match, industry keywords, manual-labor flag detection)
+- Postings scoring below 0.50 entity confidence are discarded with a warning log
+- Industry profiles: fintech, SaaS, AI, cybersecurity, ecommerce, healthcare, edtech, proptech, and more

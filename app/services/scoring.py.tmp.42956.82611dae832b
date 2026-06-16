@@ -1,0 +1,188 @@
+"""
+Multi-signal acquisition scoring engine.
+
+Signal breakdown (max 10 pts rule score):
+  Thesis match    — sector / region / maturity  (0–3)
+  Funding         — recency + stage             (0–2)
+  Hiring velocity — posting count signal        (0–1.5)
+  Tech stack      — modernity signal            (0–1)
+  News sentiment  — recent headlines            (0–0.5)
+  Risk penalty    — flags from LLM             (0–-2)
+  AI score        — blended via weight_ai
+"""
+from __future__ import annotations
+
+from difflib import SequenceMatcher
+from typing import Optional
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _fuzzy_match(value: str | None, candidates: list[str], threshold: float = 0.75) -> bool:
+    if not value or not candidates:
+        return False
+    v = value.lower().strip()
+    for c in candidates:
+        c_lower = c.lower().strip()
+        if v in c_lower or c_lower in v:
+            return True
+        if SequenceMatcher(None, v, c_lower).ratio() >= threshold:
+            return True
+    return False
+
+
+def _fmt(pts: float) -> str:
+    return f"+{pts}" if pts >= 0 else str(pts)
+
+
+# ── main scorer ───────────────────────────────────────────────────────────────
+
+def apply_acquisition_scoring(
+    company:           dict,
+    analysis:          dict,
+    preferred_sectors: list[str] | None = None,
+    preferred_regions: list[str] | None = None,
+    preferred_maturity: list[str] | None = None,
+    weight_ai:   float = 0.6,
+    weight_rules: float = 0.4,
+    funding:     Optional[dict] = None,
+    jobs:        Optional[dict] = None,
+    news:        Optional[dict] = None,
+    techstack:   Optional[dict] = None,
+) -> dict:
+
+    preferred_sectors  = preferred_sectors  or []
+    preferred_regions  = preferred_regions  or []
+    preferred_maturity = preferred_maturity or []
+
+    adjustments: list[dict] = []
+    rule_score = 0.0
+
+    sector   = analysis.get("sector_classification")
+    location = company.get("location")
+    maturity = analysis.get("maturity_stage")
+    risks    = analysis.get("risk_flags", [])
+
+    # ── 1. Thesis match (max 3) ──────────────────────────────────────────────
+    sector_match = _fuzzy_match(sector, preferred_sectors)
+    if sector_match:
+        rule_score += 1.5
+        adjustments.append({"label": f"Sector match ({sector})", "pts": 1.5, "group": "Thesis"})
+    else:
+        adjustments.append({"label": f"Sector mismatch ({sector or '—'})", "pts": 0, "group": "Thesis"})
+
+    region_match = _fuzzy_match(location, preferred_regions)
+    if region_match:
+        rule_score += 1.0
+        adjustments.append({"label": f"Region match ({location})", "pts": 1.0, "group": "Thesis"})
+    else:
+        adjustments.append({"label": f"Region mismatch ({location or '—'})", "pts": 0, "group": "Thesis"})
+
+    maturity_match = _fuzzy_match(maturity, preferred_maturity)
+    if maturity_match:
+        rule_score += 0.5
+        adjustments.append({"label": f"Maturity match ({maturity})", "pts": 0.5, "group": "Thesis"})
+    else:
+        adjustments.append({"label": f"Maturity mismatch ({maturity or '—'})", "pts": 0, "group": "Thesis"})
+
+    # ── 2. Funding signal (max 2) ────────────────────────────────────────────
+    if funding:
+        months = funding.get("months_since_raise")
+        round_type = (funding.get("last_funding_type") or "").lower()
+        total = funding.get("total_funding_usd") or 0
+
+        if months is not None:
+            if months <= 12:
+                rule_score += 1.0
+                adjustments.append({"label": f"Recent raise ({months}mo ago)", "pts": 1.0, "group": "Funding"})
+            elif months <= 24:
+                rule_score += 0.5
+                adjustments.append({"label": f"Raise within 2 years ({months}mo ago)", "pts": 0.5, "group": "Funding"})
+            else:
+                adjustments.append({"label": f"Last raise {months}mo ago", "pts": 0, "group": "Funding"})
+
+        if any(r in round_type for r in ["series b", "series c", "series d", "growth"]):
+            rule_score += 0.75
+            adjustments.append({"label": f"Institutional round ({funding['last_funding_type']})", "pts": 0.75, "group": "Funding"})
+        elif any(r in round_type for r in ["series a", "seed"]):
+            rule_score += 0.25
+            adjustments.append({"label": f"Early-stage round ({funding['last_funding_type']})", "pts": 0.25, "group": "Funding"})
+
+        if total >= 50_000_000:
+            rule_score += 0.25
+            adjustments.append({"label": f"Significant capital raised (${total/1e6:.0f}M)", "pts": 0.25, "group": "Funding"})
+    else:
+        adjustments.append({"label": "Funding data unavailable", "pts": 0, "group": "Funding"})
+
+    # ── 3. Hiring velocity (max 1.5) ─────────────────────────────────────────
+    if jobs:
+        count = jobs.get("posting_count", 0)
+        if count >= 30:
+            rule_score += 1.5
+            adjustments.append({"label": f"High hiring velocity ({count} postings)", "pts": 1.5, "group": "Hiring"})
+        elif count >= 10:
+            rule_score += 1.0
+            adjustments.append({"label": f"Moderate hiring ({count} postings)", "pts": 1.0, "group": "Hiring"})
+        elif count >= 3:
+            rule_score += 0.5
+            adjustments.append({"label": f"Low hiring activity ({count} postings)", "pts": 0.5, "group": "Hiring"})
+        else:
+            adjustments.append({"label": f"Minimal hiring ({count} postings)", "pts": 0, "group": "Hiring"})
+    else:
+        adjustments.append({"label": "Hiring data unavailable", "pts": 0, "group": "Hiring"})
+
+    # ── 4. Tech stack (max 1) ────────────────────────────────────────────────
+    if techstack:
+        signal = techstack.get("stack_signal", "unknown")
+        if signal == "modern":
+            rule_score += 1.0
+            adjustments.append({"label": "Modern tech stack", "pts": 1.0, "group": "Tech"})
+        elif signal == "mixed":
+            rule_score += 0.5
+            adjustments.append({"label": "Mixed tech stack", "pts": 0.5, "group": "Tech"})
+        elif signal == "legacy":
+            rule_score -= 0.5
+            adjustments.append({"label": "Legacy tech stack", "pts": -0.5, "group": "Tech"})
+        else:
+            adjustments.append({"label": "Tech stack signal unknown", "pts": 0, "group": "Tech"})
+    else:
+        adjustments.append({"label": "Tech stack data unavailable", "pts": 0, "group": "Tech"})
+
+    # ── 5. News sentiment (max 0.5) ──────────────────────────────────────────
+    if news and news.get("articles"):
+        count = len(news["articles"])
+        # simple heuristic: presence of recent coverage is a mild positive
+        if count >= 3:
+            rule_score += 0.5
+            adjustments.append({"label": f"Active press coverage ({count} articles)", "pts": 0.5, "group": "News"})
+        elif count >= 1:
+            rule_score += 0.25
+            adjustments.append({"label": f"Some press coverage ({count} articles)", "pts": 0.25, "group": "News"})
+    else:
+        adjustments.append({"label": "No news coverage found", "pts": 0, "group": "News"})
+
+    # ── 6. Risk penalty (max -2) ─────────────────────────────────────────────
+    risk_count = len(risks)
+    if risk_count:
+        penalty = min(risk_count * 0.5, 2.0)
+        rule_score -= penalty
+        adjustments.append({"label": f"{risk_count} risk flag(s) identified", "pts": -penalty, "group": "Risk"})
+
+    # clamp rule score to 0–10
+    rule_score = round(max(0.0, min(rule_score, 10.0)), 2)
+
+    ai_score = analysis.get("acquisition_fit_score", 0)
+
+    final_score = round(
+        (ai_score * weight_ai) + (rule_score * weight_rules),
+        2
+    )
+
+    return {
+        "ai_score":    ai_score,
+        "rule_score":  rule_score,
+        "final_score": final_score,
+        "weight_ai":   weight_ai,
+        "weight_rules": weight_rules,
+        "adjustments": adjustments,
+    }

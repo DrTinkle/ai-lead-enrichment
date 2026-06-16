@@ -1,0 +1,248 @@
+"""
+Job postings collector — free tier only.
+
+Sources (tried in order):
+  1. Adzuna API — genuinely free forever for reasonable usage.
+     Register at: https://developer.adzuna.com/
+     Env vars: ADZUNA_APP_ID, ADZUNA_APP_KEY
+
+  2. Careers page scraping — no API needed.
+     Scrapes /careers, /jobs, /work-with-us etc. and counts
+     job listing elements using common HTML patterns.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from collections import Counter
+from typing import Optional
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+TIMEOUT = 10
+UA = "lead-enrichment-bot/0.1"
+
+_ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
+
+# Common careers page paths to try
+_CAREERS_PATHS = [
+    "/careers", "/jobs", "/join-us", "/join", "/work-with-us",
+    "/about/careers", "/company/careers", "/we-are-hiring",
+    "/open-positions", "/positions", "/openings",
+]
+
+# HTML selectors that commonly wrap individual job listings
+_JOB_SELECTORS = [
+    "[class*='job-listing']",  "[class*='job-card']",
+    "[class*='position']",     "[class*='opening']",
+    "[class*='role']",         "[class*='vacancy']",
+    "li[class*='job']",        "article[class*='job']",
+    "[data-job]",              "[class*='greenhouse-job']",
+    "[class*='lever-job']",    "[class*='workable']",
+    "tr[class*='job']",
+]
+
+# ATS embed patterns — signals professional hiring infra
+_ATS_PATTERNS = {
+    "Greenhouse":  "greenhouse.io",
+    "Lever":       "lever.co",
+    "Workable":    "workable.com",
+    "Ashby":       "ashbyhq.com",
+    "Rippling":    "rippling.com",
+    "BambooHR":    "bamboohr.com",
+    "SmartRecruiters": "smartrecruiters.com",
+    "Jobvite":     "jobvite.com",
+    "iCIMS":       "icims.com",
+    "Taleo":       "taleo.net",
+}
+
+
+# ── Adzuna ────────────────────────────────────────────────────────────────────
+
+def _fetch_adzuna(company_name: str) -> Optional[dict]:
+    if not settings.ADZUNA_APP_ID or not settings.ADZUNA_APP_KEY:
+        logger.info("Adzuna keys not set — skipping")
+        return None
+
+    params = {
+        "app_id":          settings.ADZUNA_APP_ID,
+        "app_key":         settings.ADZUNA_APP_KEY,
+        "results_per_page": 50,
+        "what_or":         company_name,
+        "content-type":    "application/json",
+    }
+
+    try:
+        resp = requests.get(
+            f"{_ADZUNA_BASE}/us/search/1",
+            params=params,
+            timeout=TIMEOUT,
+        )
+    except requests.RequestException as e:
+        logger.warning(f"Adzuna request failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f"Adzuna returned {resp.status_code}")
+        return None
+
+    data  = resp.json()
+    jobs  = data.get("results", [])
+    total = data.get("count", len(jobs))
+
+    if not jobs:
+        return None
+
+    titles    = [j.get("title", "") for j in jobs]
+    functions = _classify_functions(titles)
+    locations = [
+        j.get("location", {}).get("display_name", "")
+        for j in jobs if j.get("location")
+    ]
+    top_locs = [loc for loc, _ in Counter(locations).most_common(3) if loc]
+
+    return {
+        "source":         "adzuna",
+        "posting_count":  total,
+        "top_functions":  functions,
+        "top_locations":  top_locs,
+        "sample_titles":  titles[:6],
+        "remote_count":   sum(1 for t in titles if "remote" in t.lower()),
+    }
+
+
+# ── Careers page scraper ──────────────────────────────────────────────────────
+
+def _scrape_careers_page(domain: str) -> Optional[dict]:
+    base = f"https://{domain}"
+    headers = {"User-Agent": UA}
+
+    careers_html = None
+    careers_url  = None
+
+    for path in _CAREERS_PATHS:
+        url = urljoin(base, path)
+        try:
+            resp = requests.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+        except requests.RequestException:
+            continue
+
+        if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
+            careers_html = resp.text
+            careers_url  = url
+            break
+
+    if not careers_html:
+        return None
+
+    soup = BeautifulSoup(careers_html, "lxml")
+
+    # detect ATS embed
+    ats_detected = None
+    html_lower = careers_html.lower()
+    for ats_name, ats_domain in _ATS_PATTERNS.items():
+        if ats_domain in html_lower:
+            ats_detected = ats_name
+            break
+
+    # count job listings via common selectors
+    job_count = 0
+    for selector in _JOB_SELECTORS:
+        try:
+            items = soup.select(selector)
+            if len(items) > job_count:
+                job_count = len(items)
+        except Exception:
+            continue
+
+    # fallback: count <li> or <tr> elements containing job-like keywords
+    if job_count == 0:
+        job_keywords = re.compile(
+            r"\b(engineer|developer|manager|analyst|designer|scientist|"
+            r"director|lead|specialist|coordinator|recruiter|product|sales)\b",
+            re.IGNORECASE,
+        )
+        candidates = soup.find_all(["li", "tr", "div", "article"])
+        job_count = sum(
+            1 for el in candidates
+            if job_keywords.search(el.get_text(" ", strip=True)[:80])
+        )
+        # cap to avoid false positives from nav/footer
+        job_count = min(job_count, 200)
+
+    # extract sample titles
+    titles = []
+    for el in soup.find_all(["h2", "h3", "h4", "a"], limit=60):
+        text = el.get_text(" ", strip=True)
+        if 4 < len(text) < 80 and re.search(
+            r"\b(engineer|developer|manager|analyst|designer|director|lead|"
+            r"scientist|product|sales|support|growth|operations)\b",
+            text, re.IGNORECASE,
+        ):
+            titles.append(text)
+        if len(titles) >= 8:
+            break
+
+    return {
+        "source":        "careers_page",
+        "careers_url":   careers_url,
+        "posting_count": job_count,
+        "top_functions": _classify_functions(titles),
+        "sample_titles": titles[:6],
+        "ats_detected":  ats_detected,
+        "remote_count":  sum(1 for t in titles if "remote" in t.lower()),
+        "top_locations": [],
+    }
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _classify_functions(titles: list[str]) -> list[str]:
+    buckets: dict[str, int] = {}
+    mapping = {
+        "Engineering":  ["engineer", "developer", "backend", "frontend",
+                         "fullstack", "devops", "sre", "architect", "infra"],
+        "Sales":        ["sales", "account executive", "ae", "bdr", "sdr", "revenue", "business dev"],
+        "Marketing":    ["marketing", "growth", "seo", "content", "brand", "demand"],
+        "Product":      ["product manager", "product owner", "pm"],
+        "Data / AI":    ["data scientist", "data analyst", "data engineer", "ml", "machine learning", "ai"],
+        "Design":       ["designer", "ux", "ui", "creative"],
+        "Operations":   ["operations", "ops", "supply chain", "logistics"],
+        "Finance":      ["finance", "accounting", "controller", "cfo", "fp&a"],
+        "HR / People":  ["recruiter", "people ops", "hr", "talent", "recruiting"],
+        "Customer":     ["customer success", "support", "csm", "implementation"],
+    }
+    for title in titles:
+        t = title.lower()
+        for bucket, keywords in mapping.items():
+            if any(k in t for k in keywords):
+                buckets[bucket] = buckets.get(bucket, 0) + 1
+                break
+
+    return [b for b, _ in sorted(buckets.items(), key=lambda x: -x[1])][:5]
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def fetch_job_postings(company_name: str, domain: str) -> Optional[dict]:
+    """Try Adzuna first, fall back to careers page scraping."""
+
+    result = _fetch_adzuna(company_name)
+    if result and result.get("posting_count", 0) > 0:
+        logger.info(f"Jobs: Adzuna returned {result['posting_count']} postings for {company_name}")
+        return result
+
+    result = _scrape_careers_page(domain)
+    if result:
+        logger.info(
+            f"Jobs: careers page scrape returned ~{result.get('posting_count', 0)} "
+            f"listings at {result.get('careers_url')}"
+        )
+        return result
+
+    return None

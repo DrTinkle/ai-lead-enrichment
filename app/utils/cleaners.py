@@ -2,26 +2,71 @@ import re
 
 
 def normalize_domain(domain: str) -> str:
-    # lowercase and remove trailing slash
-    return domain.lower().strip("/")
+    from urllib.parse import urlparse
+    raw = domain.lower().strip().strip("/")
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    return parsed.netloc or raw
 
 
-def normalize_industry(industry: str | None) -> str | None:
+def normalize_industry(industry):
     if not industry:
         return None
-
-    industry = industry.lower()
-
-    # simple mapping
-    if "internet" in industry:
+    i = industry.lower()
+    if any(x in i for x in ["fintech", "financial technology"]):
+        return "Fintech"
+    if any(x in i for x in ["financial services", "banking", "finance"]):
+        return "Fintech"
+    if any(x in i for x in ["saas", "software as a service"]):
+        return "SaaS"
+    if any(x in i for x in ["software", "internet", "technology", "tech"]):
         return "Internet / Technology"
-    if "financial" in industry or "fintech" in industry:
-        return "FinTech"
-
+    if any(x in i for x in ["cyber", "security", "infosec"]):
+        return "Cybersecurity"
+    if any(x in i for x in ["artificial intelligence", "machine learning", " ai ", "ml "]):
+        return "AI / Machine Learning"
+    if any(x in i for x in ["data", "analytics", "business intelligence"]):
+        return "Data & Analytics"
+    if any(x in i for x in ["health", "medical", "pharma", "clinical"]):
+        return "Healthcare"
+    if any(x in i for x in ["biotech", "life science", "genomic"]):
+        return "Biotech / Life Sciences"
+    if any(x in i for x in ["insurance", "insurtech"]):
+        return "Insurance / InsurTech"
+    if any(x in i for x in ["edtech", "education", "e-learning", "elearning"]):
+        return "EdTech"
+    if any(x in i for x in ["proptech", "real estate tech"]):
+        return "PropTech"
+    if any(x in i for x in ["legaltech", "legal tech", "legal services"]):
+        return "LegalTech"
+    if any(x in i for x in ["hr tech", "hrtech", "human resources"]):
+        return "HR Tech"
+    if any(x in i for x in ["logistics", "supply chain", "shipping", "freight"]):
+        return "Supply Chain / Logistics"
+    if any(x in i for x in ["clean energy", "cleantech", "renewable", "solar", "wind"]):
+        return "Clean Energy / CleanTech"
+    if any(x in i for x in ["media", "entertainment", "publishing", "streaming"]):
+        return "Media & Entertainment"
+    if any(x in i for x in ["gaming", "video game", "esport"]):
+        return "Gaming"
+    if any(x in i for x in ["telecom", "telecommunications", "wireless"]):
+        return "Telecommunications"
+    if any(x in i for x in ["e-commerce", "ecommerce", "online retail"]):
+        return "E-commerce"
+    if any(x in i for x in ["retail", "consumer goods", "fmcg"]):
+        return "Retail"
+    if any(x in i for x in ["food", "beverage", "restaurant"]):
+        return "Food & Beverage"
+    if any(x in i for x in ["travel", "hospitality", "hotel", "tourism"]):
+        return "Travel & Hospitality"
+    if any(x in i for x in ["manufacturing", "industrial"]):
+        return "Manufacturing"
+    if "real estate" in i:
+        return "Real Estate"
     return industry.title()
 
 
 def clean_text(text: str) -> str:
-    # collapse whitespace
     text = re.sub(r"\s+", " ", text)
     return text.strip()

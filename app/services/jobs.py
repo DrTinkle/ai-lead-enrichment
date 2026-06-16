@@ -1,0 +1,386 @@
+"""
+Job postings collector with entity resolution.
+
+Sources (in priority order):
+  1. Company careers page — highest trust, direct from company
+  2. Adzuna API — requires entity validation before use
+
+Every posting is scored for relevance to the target company.
+Postings below threshold are discarded. Confidence is reported
+alongside count so the scoring layer can decide how much to trust
+the hiring signal.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from collections import Counter
+from typing import Optional
+from urllib.parse import urljoin
+from difflib import SequenceMatcher
+
+import requests
+from bs4 import BeautifulSoup
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+TIMEOUT = 10
+UA = "Mozilla/5.0 (compatible; lead-enrichment-bot/0.1)"
+
+_ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
+
+_CAREERS_PATHS = [
+    "/careers", "/jobs", "/join-us", "/join", "/work-with-us",
+    "/about/careers", "/company/careers", "/we-are-hiring",
+    "/open-positions", "/positions", "/openings",
+]
+
+_JOB_SELECTORS = [
+    "[class*='job-listing']", "[class*='job-card']",
+    "[class*='position']",    "[class*='opening']",
+    "[class*='role']",        "[class*='vacancy']",
+    "li[class*='job']",       "article[class*='job']",
+    "[data-job]",             "[class*='greenhouse-job']",
+    "[class*='lever-job']",   "[class*='workable']",
+    "tr[class*='job']",
+]
+
+_ATS_PATTERNS = {
+    "Greenhouse":      "greenhouse.io",
+    "Lever":           "lever.co",
+    "Workable":        "workable.com",
+    "Ashby":           "ashbyhq.com",
+    "Rippling":        "rippling.com",
+    "BambooHR":        "bamboohr.com",
+    "SmartRecruiters": "smartrecruiters.com",
+    "Jobvite":         "jobvite.com",
+    "iCIMS":           "icims.com",
+    "Taleo":           "taleo.net",
+}
+
+# Industry keyword profiles for entity validation
+_INDUSTRY_PROFILES = {
+    "fintech":      ["payments","finance","banking","risk","fraud","api","transaction","compliance","kyc","aml"],
+    "saas":         ["software","platform","cloud","subscription","enterprise","b2b","api","integration"],
+    "ai":           ["machine learning","ai","artificial intelligence","data scientist","nlp","llm","model"],
+    "cybersecurity":["security","threat","vulnerability","soc","pentest","firewall","encryption","compliance"],
+    "ecommerce":    ["ecommerce","marketplace","fulfillment","logistics","merchant","shopify","retail"],
+    "healthcare":   ["health","medical","clinical","patient","hipaa","ehr","pharma","biotech"],
+    "edtech":       ["education","learning","curriculum","student","teacher","edtech","lms"],
+    "proptech":     ["real estate","property","leasing","tenant","mortgage","realty"],
+    "developer":    ["engineer","developer","backend","frontend","devops","infrastructure","platform","api"],
+    "data":         ["data","analytics","bi","warehouse","pipeline","sql","spark","dbt"],
+    "default":      ["engineer","developer","manager","analyst","designer","product","sales","marketing"],
+}
+
+# Red-flag words that suggest a posting is NOT a tech/services company
+_MANUAL_LABOR_FLAGS = {
+    "laborer","pavement","asphalt","highway","road","sealcoat","striping machine",
+    "mowing","landscaping","plumber","electrician","hvac","forklift","warehouse picker",
+    "truck driver","cdl","welding","construction crew","maintenance technician",
+}
+
+
+def _normalize(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', s.lower())
+
+
+def _name_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
+
+
+def _industry_keywords(industry: Optional[str], sector: Optional[str]) -> list[str]:
+    """Return keyword list for the company's industry."""
+    text = ((industry or "") + " " + (sector or "")).lower()
+    for key, kws in _INDUSTRY_PROFILES.items():
+        if key in text:
+            return kws
+    return _INDUSTRY_PROFILES["default"]
+
+
+def _posting_entity_score(posting: dict, company_name: str, domain: str,
+                           industry_kws: list[str]) -> float:
+    """
+    Score 0.0 - 1.0 how likely this posting belongs to the target company.
+
+    Components:
+      0.50  company name match (in posting's 'company' field)
+      0.20  domain appears in posting URL
+      0.20  industry keyword match in title/description
+      0.10  no manual-labor red-flag words
+    """
+    score = 0.0
+
+    # 1. Company name in posting's employer field
+    posting_company = posting.get("company", "") or ""
+    name_sim = _name_similarity(company_name, posting_company)
+    if name_sim >= 0.85:
+        score += 0.50
+    elif name_sim >= 0.60:
+        score += 0.25
+    elif company_name.lower() in posting_company.lower():
+        score += 0.35
+
+    # 2. Domain in posting URL
+    url = (posting.get("url") or "").lower()
+    if domain.lower() in url:
+        score += 0.20
+    elif domain.split(".")[0].lower() in url:
+        score += 0.10
+
+    # 3. Industry keyword match in title + description
+    text = (
+        (posting.get("title") or "") + " " +
+        (posting.get("description") or "")
+    ).lower()
+    kw_hits = sum(1 for kw in industry_kws if kw in text)
+    if kw_hits >= 3:
+        score += 0.20
+    elif kw_hits >= 1:
+        score += 0.10
+
+    # 4. No manual-labor red flags
+    if not any(flag in text for flag in _MANUAL_LABOR_FLAGS):
+        score += 0.10
+    else:
+        score -= 0.30  # strong signal it's wrong company
+
+    return max(0.0, min(1.0, score))
+
+
+# ── Adzuna ────────────────────────────────────────────────────────────────────
+
+def _fetch_adzuna(company_name: str, domain: str,
+                  industry: Optional[str] = None,
+                  sector: Optional[str] = None) -> Optional[dict]:
+    if not settings.ADZUNA_APP_ID or not settings.ADZUNA_APP_KEY:
+        logger.info("Adzuna keys not set — skipping")
+        return None
+
+    # Use what_phrase for exact company name match
+    params = {
+        "app_id":           settings.ADZUNA_APP_ID,
+        "app_key":          settings.ADZUNA_APP_KEY,
+        "results_per_page": 50,
+        "what_phrase":      company_name,  # exact phrase, not keyword match
+    }
+
+    try:
+        resp = requests.get(
+            f"{_ADZUNA_BASE}/us/search/1",
+            params=params,
+            headers={"Accept": "application/json"},
+            timeout=TIMEOUT,
+        )
+    except requests.RequestException as e:
+        logger.warning(f"Adzuna request failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        logger.warning(f"Adzuna returned {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    raw_jobs = resp.json().get("results", [])
+    if not raw_jobs:
+        return None
+
+    # Entity resolution — score and filter each posting
+    industry_kws = _industry_keywords(industry, sector)
+    validated = []
+    rejected  = 0
+
+    for j in raw_jobs:
+        posting = {
+            "company":     (j.get("company") or {}).get("display_name", ""),
+            "title":       j.get("title", ""),
+            "description": j.get("description", ""),
+            "url":         j.get("redirect_url", ""),
+            "location":    (j.get("location") or {}).get("display_name", ""),
+        }
+        es = _posting_entity_score(posting, company_name, domain, industry_kws)
+        posting["entity_score"] = round(es, 2)
+
+        if es >= 0.50:
+            validated.append(posting)
+        else:
+            rejected += 1
+            logger.warning(
+                f"Adzuna: rejected posting '{posting['title']}' "
+                f"(company='{posting['company']}', entity_score={es:.2f})"
+            )
+
+    if not validated:
+        logger.warning(
+            f"Adzuna: all {len(raw_jobs)} postings failed entity validation "
+            f"for {company_name!r} — likely wrong company"
+        )
+        return None
+
+    confidence = len(validated) / len(raw_jobs)
+    titles     = [p["title"] for p in validated]
+    locations  = [p["location"] for p in validated if p["location"]]
+
+    logger.warning(
+        f"Adzuna: {len(validated)}/{len(raw_jobs)} postings passed entity "
+        f"validation for {company_name!r} (confidence={confidence:.0%}, "
+        f"rejected={rejected})"
+    )
+
+    sample_listings = [
+        {"title": p["title"], "location": p["location"], "url": p["url"]}
+        for p in validated[:6]
+    ]
+
+    return {
+        "source":             "adzuna",
+        "posting_count":      len(validated),
+        "raw_count":          len(raw_jobs),
+        "rejected_count":     rejected,
+        "confidence":         round(confidence, 2),
+        "top_functions":      _classify_functions(titles),
+        "top_locations":      [l for l, _ in Counter(locations).most_common(3) if l],
+        "sample_titles":      titles[:6],
+        "sample_listings":    sample_listings,
+        "remote_count":       sum(1 for t in titles if "remote" in t.lower()),
+    }
+
+
+# ── Careers page scraper ──────────────────────────────────────────────────────
+
+def _scrape_careers_page(domain: str) -> Optional[dict]:
+    """
+    Direct scrape of the company's own careers page.
+    Highest trust — jobs found here are definitively from the right company.
+    """
+    base    = f"https://{domain}"
+    headers = {"User-Agent": UA}
+
+    careers_html = None
+    careers_url  = None
+
+    for path in _CAREERS_PATHS:
+        url = urljoin(base, path)
+        try:
+            resp = requests.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+        except requests.RequestException:
+            continue
+        if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
+            careers_html = resp.text
+            careers_url  = url
+            break
+
+    if not careers_html:
+        return None
+
+    soup = BeautifulSoup(careers_html, "lxml")
+
+    ats_detected = None
+    html_lower   = careers_html.lower()
+    for ats_name, ats_domain in _ATS_PATTERNS.items():
+        if ats_domain in html_lower:
+            ats_detected = ats_name
+            break
+
+    job_count = 0
+    for selector in _JOB_SELECTORS:
+        try:
+            items = soup.select(selector)
+            if len(items) > job_count:
+                job_count = len(items)
+        except Exception:
+            continue
+
+    if job_count == 0:
+        job_kw = re.compile(
+            r"\b(engineer|developer|manager|analyst|designer|scientist|"
+            r"director|lead|specialist|coordinator|recruiter|product|sales)\b",
+            re.IGNORECASE,
+        )
+        candidates = soup.find_all(["li", "tr", "div", "article"])
+        job_count  = min(
+            sum(1 for el in candidates if job_kw.search(el.get_text(" ", strip=True)[:80])),
+            200,
+        )
+
+    titles = []
+    for el in soup.find_all(["h2", "h3", "h4", "a"], limit=60):
+        text = el.get_text(" ", strip=True)
+        if 4 < len(text) < 80 and re.search(
+            r"\b(engineer|developer|manager|analyst|designer|director|lead|"
+            r"scientist|product|sales|support|growth|operations)\b",
+            text, re.IGNORECASE,
+        ):
+            titles.append(text)
+        if len(titles) >= 8:
+            break
+
+    return {
+        "source":          "careers_page",
+        "careers_url":     careers_url,
+        "posting_count":   job_count,
+        "confidence":      1.0,  # direct from company site — fully trusted
+        "top_functions":   _classify_functions(titles),
+        "sample_titles":   titles[:6],
+        "sample_listings": [{"title": t, "location": "", "url": ""} for t in titles[:6]],
+        "ats_detected":    ats_detected,
+        "remote_count":    sum(1 for t in titles if "remote" in t.lower()),
+        "top_locations":   [],
+    }
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _classify_functions(titles: list[str]) -> list[str]:
+    buckets: dict[str, int] = {}
+    mapping = {
+        "Engineering":  ["engineer","developer","backend","frontend","fullstack","devops","sre","architect","infra"],
+        "Sales":        ["sales","account executive","ae","bdr","sdr","revenue","business dev"],
+        "Marketing":    ["marketing","growth","seo","content","brand","demand"],
+        "Product":      ["product manager","product owner","pm"],
+        "Data / AI":    ["data scientist","data analyst","data engineer","ml","machine learning","ai"],
+        "Design":       ["designer","ux","ui","creative"],
+        "Operations":   ["operations","ops","supply chain","logistics"],
+        "Finance":      ["finance","accounting","controller","cfo","fp&a"],
+        "HR / People":  ["recruiter","people ops","hr","talent","recruiting"],
+        "Customer":     ["customer success","support","csm","implementation"],
+    }
+    for title in titles:
+        t = title.lower()
+        for bucket, keywords in mapping.items():
+            if any(k in t for k in keywords):
+                buckets[bucket] = buckets.get(bucket, 0) + 1
+                break
+    return [b for b, _ in sorted(buckets.items(), key=lambda x: -x[1])][:5]
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def fetch_job_postings(company_name: str, domain: str,
+                       industry: Optional[str] = None,
+                       sector: Optional[str] = None) -> Optional[dict]:
+    """
+    Priority:
+      1. Company careers page (confidence = 1.0, trusted source)
+      2. Adzuna with entity validation (confidence variable)
+
+    The careers page is tried first. Adzuna supplements if the
+    careers page returns 0 postings or can't be found.
+    """
+    careers = _scrape_careers_page(domain)
+    if careers and careers.get("posting_count", 0) > 0:
+        logger.warning(
+            f"Jobs: careers page returned {careers['posting_count']} postings "
+            f"for {domain} (confidence=100%)"
+        )
+        return careers
+
+    adzuna = _fetch_adzuna(company_name, domain, industry=industry, sector=sector)
+    if adzuna:
+        return adzuna
+
+    # Return careers page even if 0 count (ATS detected is still useful signal)
+    if careers:
+        return careers
+
+    return None

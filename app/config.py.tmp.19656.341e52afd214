@@ -1,0 +1,26 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Settings:
+    # Required
+    OPENAI_API_KEY: str   = os.getenv("OPENAI_API_KEY", "")
+
+    # Optional — free tier enrichment sources
+    ABSTRACT_API_KEY: str = os.getenv("ABSTRACT_API_KEY", "")       # abstractapi.com — free tier
+    NEWS_API_KEY: str     = os.getenv("NEWS_API_KEY", "")            # newsapi.org — dev/demo free tier
+    ADZUNA_APP_ID: str    = os.getenv("ADZUNA_APP_ID", "")           # developer.adzuna.com — free
+    ADZUNA_APP_KEY: str   = os.getenv("ADZUNA_APP_KEY", "")          # developer.adzuna.com — free
+    GITHUB_TOKEN: str     = os.getenv("GITHUB_TOKEN", "")            # github.com/settings/tokens — free
+
+    # Always-free sources (no key needed — used automatically)
+    # - GDELT DOC 2.0: gdeltproject.org — free forever, news fallback
+    # - SEC EDGAR: sec.gov — free forever, funding signals for US companies
+    # - Self-detected tech stack: HTML parsing, no API
+
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
+
+
+settings = Settings()
